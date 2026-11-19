@@ -139,9 +139,9 @@ class Settings:
             gemini_thinking_level=_env("GEMINI_THINKING_LEVEL", "low").upper(),
             audd_api_token=_env("AUDD_API_TOKEN", required=True),
             audd_timeout_sec=_env_float("AUDD_TIMEOUT_SEC", 8.0),
-            lemon_checkout_url=_env("LEMON_CHECKOUT_URL", required=True),
+            lemon_checkout_url=_env("LEMON_CHECKOUT_URL", ""),  # empty = payments off
             lemon_subscription_checkout_url=_env("LEMON_SUBSCRIPTION_CHECKOUT_URL", ""),
-            lemon_signing_secret=_env("LEMON_SIGNING_SECRET", required=True),
+            lemon_signing_secret=_env("LEMON_SIGNING_SECRET", ""),
             lemon_subscription_variant_ids=_env_list("LEMON_SUBSCRIPTION_VARIANT_IDS"),
             lemon_credit_pack_variant_ids=_env_list("LEMON_CREDIT_PACK_VARIANT_IDS"),
             paywall_image_url=_env("PAYWALL_IMAGE_URL", ""),
@@ -212,6 +212,10 @@ MSG_NOT_FOUND = {
     FIND_ITEM: "😕 I couldn't spot any identifiable clothes or items here.\nNo credit was used.",
     FIND_ALL: "😕 I couldn't find a song, a movie/show or identifiable items in this one.\nNo credits were used.",
 }
+MSG_PAYMENTS_SOON = (
+    "You've used all your free searches 🔋\n"
+    "Paid plans are coming very soon — stay tuned, I'll be ready for your next Reel!"
+)
 MSG_PAYMENT_CREDITS = "✅ Payment received — thank you! +{n} credits added.\nYour balance: {balance} credits.\nSend me any Reel to continue 🎬"
 MSG_PAYMENT_SUB = "✅ Unlimited is active until {date}! 🔥\nSend me any Reel — every search is on us now."
 
@@ -1237,6 +1241,9 @@ class Bot:
         return f"{base}{sep}{urlencode({'checkout[custom][igsid]': igsid})}"
 
     async def send_paywall(self, igsid: str, user: asyncpg.Record, cost: int) -> None:
+        if not self.s.lemon_checkout_url:
+            await self.safe_send(igsid, MSG_PAYMENTS_SOON)
+            return
         credits_url = self.checkout_link(self.s.lemon_checkout_url, igsid)
         buttons = [{"type": "web_url", "url": credits_url, "title": f"Get {self.s.credits_per_pack} credits"}]
         if self.s.lemon_subscription_checkout_url:
@@ -1724,6 +1731,8 @@ async def receive_webhook(request: Request, background: BackgroundTasks) -> Resp
 async def payment_webhook(request: Request, background: BackgroundTasks) -> Response:
     raw = await request.body()
     assert bot is not None
+    if not bot.s.lemon_signing_secret:
+        return JSONResponse({"error": "payments are not configured"}, status_code=503)
     signature = request.headers.get("x-signature", "")
     expected = hmac.new(bot.s.lemon_signing_secret.encode(), raw, hashlib.sha256).hexdigest()
     if not signature or not hmac.compare_digest(expected, signature):
