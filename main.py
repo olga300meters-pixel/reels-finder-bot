@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import ipaddress
 import hmac
 import json
 import logging
@@ -32,7 +33,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import quote_plus, urlencode, urlparse
+from urllib.parse import quote_plus, urlencode, urljoin, urlparse
 
 import asyncpg
 import httpx
@@ -122,6 +123,7 @@ class Settings:
     max_download_mb: int
     max_parallel_jobs: int
     tmp_root: str
+    allow_private_urls: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -159,6 +161,8 @@ class Settings:
             max_download_mb=_env_int("MAX_DOWNLOAD_MB", 80),
             max_parallel_jobs=_env_int("MAX_PARALLEL_JOBS", 4),
             tmp_root=_env("TMP_ROOT", "/tmp"),
+            # Only for local tests: lets the bot fetch media from localhost / private networks.
+            allow_private_urls=_env("ALLOW_PRIVATE_URLS", "").lower() in ("1", "true", "yes"),
         )
 
 
@@ -372,6 +376,13 @@ CREATE TABLE IF NOT EXISTS app_kv (
     value       TEXT NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Supabase exposes the public schema through its REST "Data API". Row Level Security with no
+-- policies closes that door; the bot connects as the table owner and is not affected.
+ALTER TABLE users          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE payment_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE deleted_users  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app_kv         ENABLE ROW LEVEL SECURITY;
 """
 
 
@@ -757,25 +768,75 @@ IMAGE_FORMATS = {"image2", "png_pipe", "jpeg_pipe", "webp_pipe", "bmp_pipe", "ti
 IMAGE_CODECS = {"mjpeg", "png", "webp", "bmp", "tiff", "hevc_image"}
 
 
-async def download_media(http: httpx.AsyncClient, url: str, dest: Path, max_bytes: int) -> str:
-    """Streams media to disk with a hard size cap. Returns the response content-type."""
+async def assert_public_url(url: str) -> None:
+    """Blocks SSRF: the bot must never fetch localhost, private networks or cloud metadata IPs."""
+    parts = urlparse(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise MediaUnavailable(MSG_NOT_MEDIA, f"bad url scheme/host: {parts.scheme}")
+    if parts.port not in (None, 80, 443):
+        raise MediaUnavailable(MSG_NOT_MEDIA, f"non-standard port {parts.port}")
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(parts.hostname, None)
+    except OSError as exc:
+        raise MediaUnavailable(MSG_DOWNLOAD_FAILED, f"dns error: {exc}") from exc
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        if not ip.is_global:
+            raise MediaUnavailable(MSG_NOT_MEDIA, f"blocked non-public address {ip}")
 
-    async def _do() -> str:
-        try:
+
+REDIRECT_CODES = {301, 302, 303, 307, 308}
+
+# Tried in order when a media URL answers with an HTML page instead of a file.
+DOWNLOAD_USER_AGENTS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36",
+    "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+)
+
+
+def describe_url(url: str) -> str:
+    """host + shortened path, without the query string (which carries CDN signatures)."""
+    parts = urlparse(url)
+    path = parts.path if len(parts.path) <= 60 else parts.path[:60] + "…"
+    return f"{parts.hostname}{path}"
+
+
+async def download_media(http: httpx.AsyncClient, url: str, dest: Path, max_bytes: int,
+                         allow_private: bool = False) -> str:
+    """Streams media to disk with a hard size cap. Returns the response content-type.
+    Redirects are followed manually so every hop is checked against SSRF."""
+
+    async def _attempt(user_agent: str) -> str | None:
+        """Returns content-type on success, None if the server answered with an HTML page."""
+        current = url
+        for _hop in range(5):
+            if not allow_private:
+                await assert_public_url(current)
             async with http.stream(
                 "GET",
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; ReelsFinderBot/1.0)"},
+                current,
+                headers={"User-Agent": user_agent, "Accept": "video/*,image/*,audio/*,*/*;q=0.8"},
                 timeout=httpx.Timeout(12.0, connect=4.0),
-                follow_redirects=True,
+                follow_redirects=False,
             ) as resp:
+                if resp.status_code in REDIRECT_CODES and resp.headers.get("location"):
+                    current = urljoin(current, resp.headers["location"])
+                    continue
                 if resp.status_code in (401, 403, 404, 410):
-                    raise MediaUnavailable(MSG_EXPIRED, f"media HTTP {resp.status_code}")
+                    raise MediaUnavailable(MSG_EXPIRED, f"media HTTP {resp.status_code} at {describe_url(current)}")
                 if resp.status_code >= 400:
-                    raise MediaUnavailable(MSG_DOWNLOAD_FAILED, f"media HTTP {resp.status_code}")
+                    raise MediaUnavailable(MSG_DOWNLOAD_FAILED, f"media HTTP {resp.status_code} at {describe_url(current)}")
                 ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()
                 if ctype.startswith("text/") or ctype in ("application/json",):
-                    raise MediaUnavailable(MSG_NOT_MEDIA, f"content-type {ctype}")
+                    head = b""
+                    async for chunk in resp.aiter_bytes(2048):
+                        head = chunk[:300]
+                        break
+                    snippet = re.sub(r"\s+", " ", head.decode("utf-8", "replace"))[:200]
+                    log.warning("Media URL returned %s (UA=%s…) at %s; first bytes: %r",
+                                ctype, user_agent[:20], describe_url(current), snippet)
+                    return None
                 declared = int(resp.headers.get("content-length") or 0)
                 if declared and declared > max_bytes:
                     raise MediaUnavailable(MSG_TOO_BIG, f"content-length {declared}")
@@ -789,6 +850,15 @@ async def download_media(http: httpx.AsyncClient, url: str, dest: Path, max_byte
                 if size == 0:
                     raise MediaUnavailable(MSG_DOWNLOAD_FAILED, "empty body")
                 return ctype
+        raise MediaUnavailable(MSG_DOWNLOAD_FAILED, "too many redirects")
+
+    async def _do() -> str:
+        try:
+            for user_agent in DOWNLOAD_USER_AGENTS:
+                ctype = await _attempt(user_agent)
+                if ctype is not None:
+                    return ctype
+            raise MediaUnavailable(MSG_NOT_MEDIA, f"html page instead of media at {describe_url(url)}")
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise MediaUnavailable(MSG_DOWNLOAD_FAILED, f"download error: {exc}") from exc
 
@@ -1375,10 +1445,12 @@ class Bot:
             saw_media_type = True
             url = _s((att.get("payload") or {}).get("url"))
             if url.startswith("http"):
+                log.info("Attachment type=%s keys=%s", a_type, sorted((att.get("payload") or {}).keys()))
                 return url, type_hint[a_type]
         return ("", "restricted") if saw_media_type else None
 
     async def handle_media(self, igsid: str, url: str, media_type: str) -> None:
+        log.info("Media received: type=%s url=%s", media_type, describe_url(url))
         results = await asyncio.gather(
             self.db.set_last_media(igsid, url, media_type),
             self.ig.send_text(igsid, MSG_MENU, QUICK_REPLIES),
@@ -1498,7 +1570,8 @@ class Bot:
             workdir.mkdir(parents=True, exist_ok=False)
             try:
                 src = workdir / "source"
-                ctype = await download_media(self.http, media_url, src, self.s.max_download_mb * 1024 * 1024)
+                ctype = await download_media(self.http, media_url, src, self.s.max_download_mb * 1024 * 1024,
+                                             allow_private=self.s.allow_private_urls)
                 info = await probe_media(src, ctype)
                 log.info("Media: kind=%s duration=%.1fs audio=%s ctype=%s",
                          info.kind, info.duration, info.has_audio, ctype)
