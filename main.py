@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import hmac
 import json
 import logging
 import os
 import re
 import shutil
+import string
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -36,7 +38,7 @@ import asyncpg
 import httpx
 from cachetools import TTLCache
 from fastapi import BackgroundTasks, FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
@@ -91,6 +93,9 @@ class Settings:
     ig_account_id: str
     graph_api_base: str
     bot_name: str
+    contact_email: str
+    instagram_handle: str
+    operator_name: str
     # Database
     database_url: str
     # Gemini
@@ -131,6 +136,9 @@ class Settings:
                 "https://graph.facebook.com/v26.0" if _env("IG_ACCESS_TOKEN").startswith("EAA")
                 else "https://graph.instagram.com/v24.0")).rstrip("/"),
             bot_name=_env("BOT_NAME", "Reels Finder"),
+            contact_email=_env("CONTACT_EMAIL", ""),
+            instagram_handle=_env("INSTAGRAM_HANDLE", "").lstrip("@"),
+            operator_name=_env("OPERATOR_NAME", ""),
             database_url=_env("DATABASE_URL", required=True),
             gemini_api_key=_env("GEMINI_API_KEY", required=True),
             gemini_primary_model=_env("GEMINI_PRIMARY_MODEL", "gemini-2.5-flash"),
@@ -183,6 +191,11 @@ TEXT_COMMANDS = {
 }
 BALANCE_COMMANDS = {"balance", "credits", "status", "my credits"}
 BUY_COMMANDS = {"buy", "upgrade", "pricing", "premium", "subscribe", "pay"}
+DELETE_COMMANDS = {"delete my data", "delete data", "delete my account", "remove my data"}
+MSG_DATA_DELETED = (
+    "Done ✅ Your data has been deleted: your ID, balance, subscription and last media link.\n"
+    "If you message me again, a new empty profile will be created (free searches are not renewed)."
+)
 
 MSG_OVERLOAD = "Temporary overload, your credit was not deducted. Please try again in a moment."
 MSG_MENU = "Got it! 🔥 What should I find in this one?\n(On desktop? Just reply: song, movie, outfit or all)"
@@ -349,6 +362,11 @@ CREATE TABLE IF NOT EXISTS payment_events (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS deleted_users (
+    id_hash     TEXT PRIMARY KEY,
+    deleted_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS app_kv (
     key         TEXT PRIMARY KEY,
     value       TEXT NOT NULL,
@@ -412,6 +430,17 @@ class Database:
 
     # --- users ---------------------------------------------------------------
 
+    @staticmethod
+    def _id_hash(igsid: str) -> str:
+        return hashlib.sha256(f"reels-finder:{igsid}".encode()).hexdigest()
+
+    async def _starting_credits(self, igsid: str) -> int:
+        """Users who deleted their data don't get the free searches again."""
+        assert self.pool
+        deleted = await self.pool.fetchval(
+            "SELECT 1 FROM deleted_users WHERE id_hash = $1", self._id_hash(igsid))
+        return 0 if deleted else self._free_credits
+
     async def get_or_create_user(self, igsid: str) -> asyncpg.Record:
         assert self.pool
         row = await self.pool.fetchrow("SELECT * FROM users WHERE igsid = $1", igsid)
@@ -424,8 +453,17 @@ class Database:
             RETURNING *
             """,
             igsid,
-            self._free_credits,
+            await self._starting_credits(igsid),
         )
+
+    async def delete_user(self, igsid: str) -> None:
+        """Deletes the user's profile; keeps only a one-way hash to block free-credit farming."""
+        assert self.pool
+        async with self.pool.acquire() as conn, conn.transaction():
+            await conn.execute("DELETE FROM users WHERE igsid = $1", igsid)
+            await conn.execute(
+                "INSERT INTO deleted_users (id_hash) VALUES ($1) ON CONFLICT (id_hash) DO NOTHING",
+                self._id_hash(igsid))
 
     async def set_last_media(self, igsid: str, url: str, media_type: str) -> None:
         assert self.pool
@@ -439,7 +477,7 @@ class Database:
                    updated_at = now()
             """,
             igsid,
-            self._free_credits,
+            await self._starting_credits(igsid),
             url,
             media_type,
         )
@@ -1370,6 +1408,12 @@ class Bot:
             await self.handle_action(igsid, TEXT_COMMANDS[lowered])
             return
 
+        if lowered in DELETE_COMMANDS:
+            await self.db.delete_user(igsid)
+            log.info("User data deleted on request")
+            await self.safe_send(igsid, MSG_DATA_DELETED)
+            return
+
         user = await self.db.get_or_create_user(igsid)
         if lowered in BALANCE_COMMANDS:
             await self.safe_send(igsid, self.balance_line(user))
@@ -1599,6 +1643,130 @@ class Bot:
 
 
 # =============================================================================
+# Privacy policy page (served at /privacy — use this URL in the Meta dashboard)
+# =============================================================================
+
+PRIVACY_EFFECTIVE_DATE = "November 21, 2026"
+
+PRIVACY_TEMPLATE = string.Template("""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$bot_name — Privacy Policy</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+         max-width: 760px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #1a1a1a; }
+  h1 { font-size: 28px; margin-bottom: 4px; }
+  h2 { font-size: 20px; margin-top: 32px; }
+  .muted { color: #666; font-size: 14px; }
+  li { margin-bottom: 6px; }
+  code { background: #f2f2f2; padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>$bot_name — Privacy Policy</h1>
+<p class="muted">Effective date: $effective_date</p>
+
+<p>$bot_name ("we", "us") is an Instagram Direct Message service operated by $operator via the
+Instagram account $handle_text. You forward us a Reel, video, photo or link, choose what to find,
+and we identify the song, the movie or TV show, or the clothes and items in it. This policy explains
+what data we process, why, and how you can have it deleted.</p>
+
+<h2>1. Data we collect</h2>
+<ul>
+  <li><b>Your Instagram-scoped ID</b> — a number Instagram assigns to you for our account only.
+      We do not receive or store your name, email address or phone number.</li>
+  <li><b>The link to the last media you sent us</b> and its type (video, photo or audio).</li>
+  <li><b>Your search balance</b>, subscription end date (if any) and the date you first messaged us.</li>
+  <li><b>Payment records</b> — which package you bought and when, if paid plans are enabled.
+      We never receive or store card details; payments are handled by our payment provider.</li>
+  <li><b>Comments containing the word "FIND"</b> under our posts — used only to send you a private reply.
+      We do not store the comment text.</li>
+  <li><b>Technical server logs</b> (for example, request times and errors), kept for a limited time
+      for security and troubleshooting.</li>
+</ul>
+
+<h2>2. How we process your media</h2>
+<p>When you start a search, the media is downloaded to our server temporarily. We cut an 8-second audio
+clip and/or 3 still frames from it, send them for recognition, and <b>delete all files right after
+processing</b>, usually within seconds. We do not keep your videos or photos.</p>
+
+<h2>3. Who we share data with</h2>
+<p>We share data only to provide the service. We do <b>not</b> sell your data or use it for advertising.</p>
+<ul>
+  <li><b>Meta Platforms (Instagram Messaging API)</b> — to receive and send messages.</li>
+  <li><b>Google (Gemini API)</b> — still frames, to recognize movies, shows and items.</li>
+  <li><b>AudD</b> — an 8-second audio clip, to recognize the song.</li>
+  <li><b>Railway</b> — server hosting (United States).</li>
+  <li><b>Supabase</b> — database hosting (United States).</li>
+  <li><b>Our payment provider</b> — to process purchases, under its own privacy policy, if paid plans are enabled.</li>
+</ul>
+
+<h2>4. Why we process data</h2>
+<p>To perform the searches you request, keep track of free and paid searches, confirm payments,
+reply to your messages and comments, and keep the service secure.</p>
+
+<h2>5. How long we keep data</h2>
+<ul>
+  <li>Your ID, balance and dates are kept while you use the service or until you ask us to delete them.</li>
+  <li>Payment records may be kept longer where accounting or tax law requires it.</li>
+  <li>Media files are not stored (see section 2).</li>
+</ul>
+
+<h2 id="delete">6. How to delete your data</h2>
+<p>You can delete your data at any time, in either of these ways:</p>
+<ul>
+  <li>Send <code>delete my data</code> to $handle_text in Instagram Direct. Deletion happens immediately
+      and you get a confirmation.</li>
+  <li>Or email <a href="mailto:$email">$email</a> from any address, including your Instagram username.
+      We delete the data within 30 days and confirm by reply.</li>
+</ul>
+<p>Deletion removes your ID, balance, subscription and media link. Remaining searches and subscription
+time are lost. To prevent abuse of free searches, we keep only a one-way (irreversible) hash of your ID,
+which cannot be used to identify you.</p>
+
+<h2>7. Your rights</h2>
+<p>You can ask what data we hold about you, ask us to correct or delete it, and stop using the service at
+any time. If you are in the European Union or the UK, you have rights under the GDPR, including access,
+rectification, erasure, restriction and objection, and the right to complain to your data protection
+authority. If you are a California resident, you have rights under the CCPA, including the right to know
+and to delete; we do not sell or share personal information for advertising. Contact us at
+<a href="mailto:$email">$email</a> to exercise any of these rights.</p>
+
+<h2>8. Children</h2>
+<p>The service is not intended for anyone under 13 (under 16 in the EU). We do not knowingly collect
+data from children. If you believe a child has used the service, contact us and we will delete the data.</p>
+
+<h2>9. Security</h2>
+<p>All connections are encrypted (HTTPS/TLS), database access is restricted, and secret keys are not
+stored in our code.</p>
+
+<h2>10. Cookies</h2>
+<p>The Instagram service does not use cookies.</p>
+
+<h2>11. Changes to this policy</h2>
+<p>We will post any changes on this page and update the effective date above.</p>
+
+<h2>12. Contact</h2>
+<p>$operator — <a href="mailto:$email">$email</a></p>
+</body>
+</html>
+""")
+
+
+def render_privacy_page(s: Settings) -> str:
+    handle = f"@{s.instagram_handle}" if s.instagram_handle else "our Instagram account"
+    return PRIVACY_TEMPLATE.substitute(
+        bot_name=html.escape(s.bot_name),
+        effective_date=PRIVACY_EFFECTIVE_DATE,
+        operator=html.escape(s.operator_name or s.bot_name),
+        handle_text=html.escape(handle),
+        email=html.escape(s.contact_email or "the email listed on our Instagram profile"),
+    )
+
+
+# =============================================================================
 # FastAPI application
 # =============================================================================
 
@@ -1664,6 +1832,12 @@ def _verify_meta_signature(raw: bytes, header: str | None, secrets: list[str]) -
 @app.get("/")
 async def root() -> dict:
     return {"status": "ok", "service": "reels-finder-bot"}
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy() -> HTMLResponse:
+    settings = bot.s if bot else Settings.from_env()
+    return HTMLResponse(render_privacy_page(settings))
 
 
 @app.get("/health")
