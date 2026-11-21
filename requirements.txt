@@ -4,3 +4,4 @@ httpx==0.28.1
 asyncpg==0.32.0
 google-genai==3.3.0
 cachetools==8.0.0
+yt-dlp>=2026.10.26
