@@ -284,6 +284,7 @@ UNSUPPORTED_LINK_DOMAINS = (
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 FIND_KEYWORD_RE = re.compile(r"\bfind\b", re.IGNORECASE)
 
+BUILD = "2026-11-21 reel-downloader"  # shown in the startup log to confirm which code is deployed
 IG_TEXT_LIMIT = 950  # Instagram text messages must be < 1000 characters
 
 
@@ -2317,7 +2318,8 @@ async def lifespan(app: FastAPI):
     await bot.ensure_webhook_subscription()
     refresh_task = asyncio.create_task(bot.token_refresh_loop())
     poll_task = asyncio.create_task(bot.inbox_poll_loop())
-    log.info("Bot started (models: %s → %s)", settings.gemini_primary_model, settings.gemini_fallback_model)
+    log.info("Bot started [build %s] (models: %s → %s)", BUILD, settings.gemini_primary_model,
+             settings.gemini_fallback_model)
     try:
         yield
     finally:
