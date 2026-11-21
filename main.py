@@ -125,6 +125,9 @@ class Settings:
     inbox_poll_sec: int
     tmp_root: str
     allow_private_urls: bool
+    # Reel downloader (yt-dlp)
+    ig_cookies: str
+    download_proxy: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -166,6 +169,10 @@ class Settings:
             tmp_root=_env("TMP_ROOT", "/tmp"),
             # Only for local tests: lets the bot fetch media from localhost / private networks.
             allow_private_urls=_env("ALLOW_PRIVATE_URLS", "").lower() in ("1", "true", "yes"),
+            # Optional: cookies.txt of a spare Instagram account (raw or base64) and a proxy
+            # (http://user:pass@host:port) — only needed if Instagram starts blocking the server.
+            ig_cookies=_env("IG_COOKIES", ""),
+            download_proxy=_env("DOWNLOAD_PROXY", ""),
         )
 
 
@@ -208,8 +215,13 @@ MSG_OVERLOAD = "Temporary overload, your credit was not deducted. Please try aga
 MSG_MENU = "Got it! 🔥 What should I find in this one?\n(On desktop? Just reply: song, movie, outfit or all)"
 MSG_NO_MEDIA = "Send me a Reel, video or photo first 🙂\nTap ✈️ under any Reel → send it to me."
 MSG_LINK_UNSUPPORTED = (
-    "I can't open Instagram / TikTok / YouTube links directly 🙈\n"
-    "Please share the Reel itself: tap ✈️ under the Reel and send it to me — it works instantly."
+    "I can't open TikTok / YouTube links yet 🙈\n"
+    "Send me an Instagram Reel (tap ✈️ under it → send to me) or the video file itself."
+)
+MSG_REEL_BLOCKED = (
+    "Instagram didn't let me open this Reel right now 😕 (it may be private or restricted).\n"
+    "Quick fix: screen-record it with sound (or save the video) and send me the file. "
+    "For movie/outfit search a screenshot works too.\nNo credit was used."
 )
 MSG_MEDIA_RESTRICTED = (
     "I couldn't access this Reel 😕 It may be from a private account or restricted by the author.\n"
@@ -259,7 +271,12 @@ def private_reply_text(free_credits: int) -> str:
     )
 
 
-# Domains whose *page* links cannot be fetched through the official API.
+# Instagram post / Reel page links (Meta sends these instead of a video file for shared Reels).
+IG_POST_RE = re.compile(
+    r"^https?://(?:www\.|m\.)?instagram\.com/(?:[A-Za-z0-9_.]+/)?(reels?|p|tv)/([A-Za-z0-9_-]{5,})",
+    re.IGNORECASE,
+)
+# Domains whose *page* links we cannot fetch.
 UNSUPPORTED_LINK_DOMAINS = (
     "instagram.com", "instagr.am", "tiktok.com", "youtube.com", "youtu.be",
     "facebook.com", "fb.watch", "x.com", "twitter.com", "pinterest.",
@@ -911,6 +928,174 @@ DOWNLOAD_USER_AGENTS = (
 )
 
 
+def instagram_post_url(url: str) -> str | None:
+    """Canonical https://www.instagram.com/<reel|p|tv>/<code>/ for an Instagram post link, else None."""
+    m = IG_POST_RE.match(url.strip())
+    if not m:
+        return None
+    kind = "reel" if m.group(1).lower().startswith("reel") else m.group(1).lower()
+    return f"https://www.instagram.com/{kind}/{m.group(2)}/"
+
+
+@dataclass
+class ResolvedPost:
+    video_url: str = ""   # progressive mp4 (video + audio)
+    dash_video: str = ""  # used only if no progressive format exists
+    dash_audio: str = ""
+    thumbnail: str = ""
+
+
+def pick_post_formats(info: dict) -> ResolvedPost:
+    """Chooses the lightest usable formats from yt-dlp's info dict (no network)."""
+    if info.get("_type") == "playlist":  # carousel: first entry that has a video, else the first one
+        entries = [e for e in (info.get("entries") or []) if e]
+        with_video = [e for e in entries if e.get("formats") or e.get("url")]
+        info = (with_video or entries or [{}])[0]
+    out = ResolvedPost(thumbnail=_s(info.get("thumbnail")))
+    formats = [f for f in (info.get("formats") or []) if _s(f.get("url")).startswith("http")]
+    if not formats and _s(info.get("url")).startswith("http"):
+        formats = [info]
+
+    def has(f: dict, kind: str) -> bool:
+        return _s(f.get(kind)) not in ("none",)  # missing codec info = unknown = assume present
+
+    def height(f: dict) -> int:
+        return int(f.get("height") or 0)
+
+    def by_size(f: dict) -> tuple:  # prefer ~480-720p: enough for vision, small for speed
+        h = height(f)
+        return (0 if 400 <= h <= 1080 else 1, abs(h - 720) if h else 9999)
+
+    progressive = [f for f in formats if has(f, "vcodec") and has(f, "acodec")
+                   and "dash" not in _s(f.get("format_id")).lower()]
+    if progressive:
+        out.video_url = sorted(progressive, key=by_size)[0]["url"]
+        return out
+    videos = [f for f in formats if has(f, "vcodec") and _s(f.get("acodec")) == "none"]
+    audios = [f for f in formats if has(f, "acodec") and _s(f.get("vcodec")) == "none"]
+    if videos:
+        out.dash_video = sorted(videos, key=by_size)[0]["url"]
+    if audios:
+        out.dash_audio = sorted(audios, key=lambda f: float(f.get("abr") or f.get("tbr") or 0))[-1]["url"]
+    if not videos and not audios and formats:
+        out.video_url = formats[-1]["url"]
+    return out
+
+
+class _QuietYtdlLogger:
+    def debug(self, msg: str) -> None: ...
+    def info(self, msg: str) -> None: ...
+    def warning(self, msg: str) -> None: ...
+    def error(self, msg: str) -> None:
+        log.debug("yt-dlp: %s", msg)
+
+
+class ReelExtractor:
+    """Resolves an Instagram Reel/post page into direct CDN media URLs with yt-dlp.
+    Results are cached per post for 10 minutes, so a second button tap is instant."""
+
+    def __init__(self, cookies: str = "", proxy: str = "", tmp_root: str = "/tmp"):
+        self.proxy = proxy
+        self.cookiefile = self._write_cookies(cookies, tmp_root) if cookies else ""
+        self.cache: TTLCache = TTLCache(maxsize=500, ttl=600)
+        self.inflight: dict[str, asyncio.Task] = {}
+
+    @staticmethod
+    def _write_cookies(raw: str, tmp_root: str) -> str:
+        text = raw.strip()
+        if "\t" not in text:
+            try:
+                import base64
+                text = base64.b64decode(text).decode("utf-8")
+            except Exception:  # noqa: BLE001
+                log.warning("IG_COOKIES is neither a cookies.txt nor base64 of one — ignored")
+                return ""
+        if not text.startswith("# Netscape"):
+            text = "# Netscape HTTP Cookie File\n" + text
+        path = Path(tmp_root) / f"igcookies-{uuid.uuid4().hex}.txt"
+        path.write_text(text + "\n")
+        path.chmod(0o600)
+        log.info("Instagram cookies loaded for the Reel downloader")
+        return str(path)
+
+    def _extract_sync(self, url: str) -> dict:
+        import yt_dlp  # imported lazily: heavy module
+
+        opts: dict[str, Any] = {
+            "quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": False,
+            "socket_timeout": 10, "extractor_retries": 1, "logger": _QuietYtdlLogger(),
+            "cachedir": False,
+        }
+        if self.cookiefile:
+            opts["cookiefile"] = self.cookiefile
+        if self.proxy:
+            opts["proxy"] = self.proxy
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False) or {}
+
+    async def _resolve_uncached(self, url: str) -> ResolvedPost:
+        started = asyncio.get_running_loop().time()
+        try:
+            info = await asyncio.wait_for(asyncio.to_thread(self._extract_sync, url), timeout=20)
+        except asyncio.TimeoutError as exc:
+            raise MediaUnavailable(MSG_REEL_BLOCKED, "reel extractor timeout") from exc
+        except Exception as exc:  # noqa: BLE001 — yt-dlp raises many types
+            reason = re.sub(r"\s+", " ", str(exc))[:300]
+            raise MediaUnavailable(MSG_REEL_BLOCKED, f"reel extractor failed: {reason}") from exc
+        post = pick_post_formats(info)
+        log.info("Reel resolved in %.1fs: progressive=%s dash_video=%s dash_audio=%s thumb=%s",
+                 asyncio.get_running_loop().time() - started, bool(post.video_url),
+                 bool(post.dash_video), bool(post.dash_audio), bool(post.thumbnail))
+        return post
+
+    async def resolve(self, url: str) -> ResolvedPost:
+        if url in self.cache:
+            return self.cache[url]
+        task = self.inflight.get(url)
+        if task is None:  # several taps / prefetch share one extraction
+            task = asyncio.create_task(self._resolve_uncached(url))
+            self.inflight[url] = task
+            task.add_done_callback(lambda _t, u=url: self.inflight.pop(u, None))
+        post = await asyncio.shield(task)
+        self.cache[url] = post
+        return post
+
+    def prefetch(self, url: str) -> None:
+        """Starts resolving while the user is still choosing a button."""
+        async def _run() -> None:
+            try:
+                await self.resolve(url)
+            except Exception as exc:  # noqa: BLE001
+                log.info("Reel prefetch failed: %s", exc)
+        if url not in self.cache and url not in self.inflight:
+            asyncio.create_task(_run())
+
+
+OG_IMAGE_RE = re.compile(
+    r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']'
+    r'|<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+    re.IGNORECASE,
+)
+
+
+async def fetch_og_image(http: httpx.AsyncClient, page_url: str) -> str:
+    """Cover image from the post page's Open Graph tags (what link previews use). '' if none."""
+    try:
+        async with http.stream("GET", page_url, headers={"User-Agent": DOWNLOAD_USER_AGENTS[-1]},
+                               timeout=httpx.Timeout(8.0, connect=4.0), follow_redirects=True) as resp:
+            if resp.status_code != 200:
+                return ""
+            body = b""
+            async for chunk in resp.aiter_bytes(64 * 1024):
+                body += chunk
+                if len(body) > 512 * 1024 or b"og:image" in body and b"</head>" in body:
+                    break
+    except httpx.HTTPError:
+        return ""
+    m = OG_IMAGE_RE.search(body.decode("utf-8", "replace"))
+    return html.unescape(m.group(1) or m.group(2)) if m else ""
+
+
 def describe_url(url: str) -> str:
     """host + shortened path, without the query string (which carries CDN signatures)."""
     parts = urlparse(url)
@@ -1432,6 +1617,7 @@ class Bot:
         self.locks = UserLocks()
         self.jobs = asyncio.Semaphore(settings.max_parallel_jobs)
         self.seen_accounts: set[str] = set()
+        self.reels = ReelExtractor(settings.ig_cookies, settings.download_proxy, settings.tmp_root)
 
     # ---------------------------------------------------------------- helpers
 
@@ -1567,6 +1753,9 @@ class Bot:
 
     async def handle_media(self, igsid: str, url: str, media_type: str, mid: str = "") -> None:
         log.info("Media received: type=%s url=%s", media_type, describe_url(url))
+        ig_url = instagram_post_url(url)
+        if ig_url:
+            self.reels.prefetch(ig_url)
         results = await asyncio.gather(
             self.db.set_last_media(igsid, url, media_type, mid),
             self.ig.send_text(igsid, MSG_MENU, QUICK_REPLIES),
@@ -1586,6 +1775,9 @@ class Bot:
         if url_match:
             url = url_match.group(0).rstrip(").,!?")
             host = (urlparse(url).hostname or "").lower()
+            if instagram_post_url(url):
+                await self.handle_media(igsid, url, "video")
+                return
             if any(d in host for d in UNSUPPORTED_LINK_DOMAINS):
                 await self.safe_send(igsid, MSG_LINK_UNSUPPORTED)
                 return
@@ -1686,7 +1878,8 @@ class Bot:
             workdir.mkdir(parents=True, exist_ok=False)
             try:
                 src = workdir / "source"
-                ctype = await self.download_with_fallback(media_url, mid, src)
+                ctype = await self.download_with_fallback(
+                    media_url, mid, src, cover_ok=action in (FIND_MOVIE, FIND_ITEM))
                 info = await probe_media(src, ctype)
                 log.info("Media: kind=%s duration=%.1fs audio=%s ctype=%s",
                          info.kind, info.duration, info.has_audio, ctype)
@@ -1717,9 +1910,14 @@ class Bot:
             finally:
                 shutil.rmtree(workdir, ignore_errors=True)
 
-    async def download_with_fallback(self, media_url: str, mid: str, dest: Path) -> str:
-        """Downloads the webhook URL; if it is an HTML page, asks the Graph API for other URLs."""
+    async def download_with_fallback(self, media_url: str, mid: str, dest: Path,
+                                     cover_ok: bool = False) -> str:
+        """Instagram post links go through the Reel downloader; anything else is fetched directly
+        (and if that returns an HTML page, the Graph API is asked for other URLs)."""
         max_bytes = self.s.max_download_mb * 1024 * 1024
+        ig_url = instagram_post_url(media_url)
+        if ig_url:
+            return await self.download_instagram_post(ig_url, dest, max_bytes, cover_ok)
         try:
             return await download_media(self.http, media_url, dest, max_bytes,
                                         allow_private=self.s.allow_private_urls)
@@ -1740,6 +1938,64 @@ class Bot:
                 except MediaUnavailable as exc:
                     log.info("Alternative %s failed: %s", describe_url(alt), exc)
             raise first_exc
+
+    async def download_instagram_post(self, ig_url: str, dest: Path, max_bytes: int, cover_ok: bool) -> str:
+        allow = self.s.allow_private_urls
+        post: ResolvedPost | None = None
+        try:
+            post = await self.reels.resolve(ig_url)
+        except MediaUnavailable as exc:
+            log.warning("Reel downloader: %s (%s)", exc, describe_url(ig_url))
+
+        if post and post.video_url:
+            try:
+                return await download_media(self.http, post.video_url, dest, max_bytes, allow_private=allow)
+            except MediaUnavailable as exc:
+                if exc.user_message == MSG_TOO_BIG:
+                    raise
+                log.warning("Reel video download failed: %s", exc)
+                self.reels.cache.pop(ig_url, None)
+        elif post and (post.dash_video or post.dash_audio):
+            try:
+                return await self._download_dash(post, dest, max_bytes)
+            except MediaUnavailable as exc:
+                if exc.user_message == MSG_TOO_BIG:
+                    raise
+                log.warning("Reel DASH download failed: %s", exc)
+                self.reels.cache.pop(ig_url, None)
+
+        if cover_ok:  # movie / outfit search can work from the cover frame alone
+            cover = (post.thumbnail if post else "") or await fetch_og_image(self.http, ig_url)
+            if cover:
+                try:
+                    ctype = await download_media(self.http, cover, dest, max_bytes, allow_private=allow)
+                    log.info("Using the Reel cover image instead of the video")
+                    return ctype
+                except MediaUnavailable as exc:
+                    log.warning("Reel cover download failed: %s", exc)
+        raise MediaUnavailable(MSG_REEL_BLOCKED, f"could not fetch {describe_url(ig_url)}")
+
+    async def _download_dash(self, post: ResolvedPost, dest: Path, max_bytes: int) -> str:
+        """Separate video + audio tracks → one mp4 (stream copy, no re-encode)."""
+        allow = self.s.allow_private_urls
+        parts: list[tuple[str, Path]] = []
+        if post.dash_video:
+            parts.append((post.dash_video, dest.with_name("dash_v")))
+        if post.dash_audio:
+            parts.append((post.dash_audio, dest.with_name("dash_a")))
+        await asyncio.gather(*(download_media(self.http, u, p, max_bytes, allow_private=allow)
+                               for u, p in parts))
+        if len(parts) == 1:
+            parts[0][1].replace(dest)
+            return "video/mp4" if post.dash_video else "audio/mp4"
+        out = dest.with_name("merged.mp4")
+        rc, _out, err = await run_cmd(
+            ["ffmpeg", "-v", "error", "-y", "-i", str(parts[0][1]), "-i", str(parts[1][1]),
+             "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-f", "mp4", str(out)], timeout=15)
+        if rc != 0:
+            raise MediaUnavailable(MSG_DOWNLOAD_FAILED, f"dash merge failed: {err[:200]!r}")
+        out.replace(dest)
+        return "video/mp4"
 
     # ---------------------------------------------------------------- inbox polling
 
