@@ -122,6 +122,7 @@ class Settings:
     # Runtime limits
     max_download_mb: int
     max_parallel_jobs: int
+    inbox_poll_sec: int
     tmp_root: str
     allow_private_urls: bool
 
@@ -160,6 +161,8 @@ class Settings:
             subscription_days=_env_int("SUBSCRIPTION_DAYS", 30),
             max_download_mb=_env_int("MAX_DOWNLOAD_MB", 80),
             max_parallel_jobs=_env_int("MAX_PARALLEL_JOBS", 4),
+            # Picks up DMs stuck in "Message requests" (Meta may not send webhooks for them). 0 = off.
+            inbox_poll_sec=_env_int("INBOX_POLL_SEC", 10),
             tmp_root=_env("TMP_ROOT", "/tmp"),
             # Only for local tests: lets the bot fetch media from localhost / private networks.
             allow_private_urls=_env("ALLOW_PRIVATE_URLS", "").lower() in ("1", "true", "yes"),
@@ -357,6 +360,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_media_type TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_notice  TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_media_mid  TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at      TIMESTAMPTZ NOT NULL DEFAULT now();
 
 CREATE TABLE IF NOT EXISTS payment_events (
@@ -476,21 +480,23 @@ class Database:
                 "INSERT INTO deleted_users (id_hash) VALUES ($1) ON CONFLICT (id_hash) DO NOTHING",
                 self._id_hash(igsid))
 
-    async def set_last_media(self, igsid: str, url: str, media_type: str) -> None:
+    async def set_last_media(self, igsid: str, url: str, media_type: str, mid: str = "") -> None:
         assert self.pool
         await self.pool.execute(
             """
-            INSERT INTO users (igsid, credits, last_media_url, last_media_type)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO users (igsid, credits, last_media_url, last_media_type, last_media_mid)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (igsid) DO UPDATE
                SET last_media_url = EXCLUDED.last_media_url,
                    last_media_type = EXCLUDED.last_media_type,
+                   last_media_mid = EXCLUDED.last_media_mid,
                    updated_at = now()
             """,
             igsid,
             await self._starting_credits(igsid),
             url,
             media_type,
+            mid or None,
         )
 
     async def charge(self, igsid: str, cost: int) -> int | None:
@@ -620,6 +626,61 @@ def split_text(text: str, limit: int = IG_TEXT_LIMIT) -> list[str]:
     return chunks
 
 
+def extract_graph_media(message: dict[str, Any]) -> list[str]:
+    """Media URLs from a Graph API message object (attachments + shares)."""
+    urls: list[str] = []
+    for a in (message.get("attachments") or {}).get("data") or []:
+        for key in ("video_data", "image_data"):
+            u = _s((a.get(key) or {}).get("url"))
+            if u:
+                urls.append(u)
+        if _s(a.get("file_url")):
+            urls.append(_s(a.get("file_url")))
+    for sh in (message.get("shares") or {}).get("data") or []:
+        for key in ("url", "link"):
+            if _s(sh.get(key)):
+                urls.append(_s(sh.get(key)))
+    seen: set[str] = set()
+    return [u for u in urls if u.startswith("http") and not (u in seen or seen.add(u))]
+
+
+def graph_message_to_event(message: dict[str, Any], own_id: str) -> dict[str, Any] | None:
+    """Turns a Graph API message into the same shape as a messaging webhook event."""
+    sender = _s((message.get("from") or {}).get("id"))
+    mid = _s(message.get("id"))
+    if not sender or not mid:
+        return None
+    attachments: list[dict[str, Any]] = []
+    for a in (message.get("attachments") or {}).get("data") or []:
+        if _s((a.get("video_data") or {}).get("url")):
+            attachments.append({"type": "video", "payload": {"url": a["video_data"]["url"]}})
+        elif _s((a.get("image_data") or {}).get("url")):
+            attachments.append({"type": "image", "payload": {"url": a["image_data"]["url"]}})
+        elif _s(a.get("file_url")):
+            attachments.append({"type": "share", "payload": {"url": a["file_url"]}})
+    for sh in (message.get("shares") or {}).get("data") or []:
+        url = _s(sh.get("url")) or _s(sh.get("link"))
+        kind = _s(sh.get("type")).lower()
+        if url:
+            attachments.append({"type": kind if kind in ("ig_reel", "reel", "ig_post") else "share",
+                                "payload": {"url": url}})
+    msg: dict[str, Any] = {"mid": mid}
+    if _s(message.get("message")):
+        msg["text"] = _s(message.get("message"))
+    if attachments:
+        msg["attachments"] = attachments
+    if "text" not in msg and "attachments" not in msg:
+        return None
+    return {"sender": {"id": sender}, "recipient": {"id": own_id}, "message": msg}
+
+
+def parse_graph_time(value: str) -> datetime | None:
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z")
+    except (TypeError, ValueError):
+        return None
+
+
 class InstagramClient:
     def __init__(self, http: httpx.AsyncClient, base: str, account_id: str, token: str):
         self._http = http
@@ -697,6 +758,61 @@ class InstagramClient:
 
     async def send_private_reply(self, comment_id: str, text: str) -> None:
         await self._post({"recipient": {"comment_id": comment_id}, "message": {"text": text}})
+
+    async def _get(self, path: str, params: dict[str, str]) -> dict[str, Any]:
+        resp = await self._http.get(
+            f"{self._base}/{path}",
+            params=params,
+            headers={"Authorization": f"Bearer {self.token}"},
+            timeout=httpx.Timeout(10.0, connect=3.0),
+        )
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        if resp.status_code >= 400 or "error" in data:
+            err = data.get("error") or {}
+            raise GraphAPIError(resp.status_code, err.get("code"), err.get("error_subcode"),
+                                err.get("message") or resp.text[:300])
+        return data
+
+    async def get_message_media_urls(self, mid: str) -> list[str]:
+        """Alternative media URLs for a message, read through the Graph API."""
+        for fields in ("attachments{video_data,image_data,file_url},shares{link,url,type,name}",
+                       "attachments,shares"):
+            try:
+                data = await self._get(mid, {"fields": fields})
+                break
+            except GraphAPIError as exc:
+                log.warning("Message lookup with fields %s failed: %s", fields, exc)
+        else:
+            return []
+        log.info("Message lookup keys: %s", sorted(data.keys()))
+        return extract_graph_media(data)
+
+    async def list_recent_messages(self) -> list[dict[str, Any]]:
+        """Recent messages across conversations, including the Requests folder."""
+        field_sets = (
+            "updated_time,messages.limit(5){id,created_time,from,message,"
+            "attachments{video_data,image_data,file_url},shares{link,url,type,name}}",
+            "updated_time,messages.limit(5){id,created_time,from,message,attachments,shares}",
+        )
+        last_exc: GraphAPIError | None = None
+        for fields in field_sets:
+            try:
+                data = await self._get(f"{self._account_id}/conversations",
+                                       {"platform": "instagram", "fields": fields, "limit": "10"})
+                break
+            except GraphAPIError as exc:
+                last_exc = exc
+                if exc.code != 100:  # 100 = invalid parameter/field: try the simpler field set
+                    raise
+        else:
+            raise last_exc or GraphAPIError(0, None, None, "conversations unavailable")
+        out: list[dict[str, Any]] = []
+        for conv in data.get("data") or []:
+            out.extend((conv.get("messages") or {}).get("data") or [])
+        return out
 
     async def subscribe_app(self, fields: str) -> dict[str, Any]:
         """Subscribes the Instagram account to this app's webhooks (needed for Unified login)."""
@@ -1415,7 +1531,7 @@ class Bot:
                 elif media == ("", "restricted"):
                     await self.safe_send(sender, MSG_MEDIA_RESTRICTED)
                 else:
-                    await self.handle_media(sender, *media)
+                    await self.handle_media(sender, *media, mid=_s(msg.get("mid")))
                 return
 
             await self.handle_text(sender, _s(msg.get("text")))
@@ -1449,10 +1565,10 @@ class Bot:
                 return url, type_hint[a_type]
         return ("", "restricted") if saw_media_type else None
 
-    async def handle_media(self, igsid: str, url: str, media_type: str) -> None:
+    async def handle_media(self, igsid: str, url: str, media_type: str, mid: str = "") -> None:
         log.info("Media received: type=%s url=%s", media_type, describe_url(url))
         results = await asyncio.gather(
-            self.db.set_last_media(igsid, url, media_type),
+            self.db.set_last_media(igsid, url, media_type, mid),
             self.ig.send_text(igsid, MSG_MENU, QUICK_REPLIES),
             return_exceptions=True,
         )
@@ -1525,7 +1641,7 @@ class Bot:
                     return
 
                 try:
-                    outcome = await self.run_search(action, user["last_media_url"])
+                    outcome = await self.run_search(action, user["last_media_url"], user["last_media_mid"] or "")
                 except MediaUnavailable as exc:
                     log.info("Media unavailable for %s: %s", igsid, exc)
                     await self.safe_send(igsid, exc.user_message, QUICK_REPLIES if exc.user_message in
@@ -1564,14 +1680,13 @@ class Bot:
                 if not typing_task.done():
                     typing_task.cancel()
 
-    async def run_search(self, action: str, media_url: str) -> SearchOutcome:
+    async def run_search(self, action: str, media_url: str, mid: str = "") -> SearchOutcome:
         async with self.jobs:
             workdir = Path(self.s.tmp_root) / uuid.uuid4().hex  # /tmp/{uuid}
             workdir.mkdir(parents=True, exist_ok=False)
             try:
                 src = workdir / "source"
-                ctype = await download_media(self.http, media_url, src, self.s.max_download_mb * 1024 * 1024,
-                                             allow_private=self.s.allow_private_urls)
+                ctype = await self.download_with_fallback(media_url, mid, src)
                 info = await probe_media(src, ctype)
                 log.info("Media: kind=%s duration=%.1fs audio=%s ctype=%s",
                          info.kind, info.duration, info.has_audio, ctype)
@@ -1601,6 +1716,79 @@ class Bot:
                 return outcome
             finally:
                 shutil.rmtree(workdir, ignore_errors=True)
+
+    async def download_with_fallback(self, media_url: str, mid: str, dest: Path) -> str:
+        """Downloads the webhook URL; if it is an HTML page, asks the Graph API for other URLs."""
+        max_bytes = self.s.max_download_mb * 1024 * 1024
+        try:
+            return await download_media(self.http, media_url, dest, max_bytes,
+                                        allow_private=self.s.allow_private_urls)
+        except MediaUnavailable as first_exc:
+            if first_exc.user_message not in (MSG_NOT_MEDIA, MSG_EXPIRED) or not mid:
+                raise
+            try:
+                alternatives = [u for u in await self.ig.get_message_media_urls(mid) if u != media_url]
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Graph media lookup failed: %s", exc)
+                raise first_exc from exc
+            log.info("Trying %d alternative media URL(s): %s", len(alternatives),
+                     [describe_url(u) for u in alternatives])
+            for alt in alternatives:
+                try:
+                    return await download_media(self.http, alt, dest, max_bytes,
+                                                allow_private=self.s.allow_private_urls)
+                except MediaUnavailable as exc:
+                    log.info("Alternative %s failed: %s", describe_url(alt), exc)
+            raise first_exc
+
+    # ---------------------------------------------------------------- inbox polling
+
+    def mark_seen_event(self, sender: str, timestamp_ms: int) -> None:
+        """Second dedup key (sender + second) in case webhook mids differ from Graph message ids."""
+        if sender and timestamp_ms:
+            self.dedup.seen(f"t:{sender}:{timestamp_ms // 1000}")
+
+    async def poll_inbox_once(self, not_before: datetime) -> None:
+        own_id = self.s.ig_account_id
+        now = datetime.now(timezone.utc)
+        for message in await self.ig.list_recent_messages():
+            created = parse_graph_time(_s(message.get("created_time")))
+            if not created or created < not_before or now - created > timedelta(minutes=15):
+                continue
+            if now - created < timedelta(seconds=4):
+                continue  # give the webhook a moment to arrive first
+            sender = _s((message.get("from") or {}).get("id"))
+            if not sender or sender == own_id:
+                continue
+            mid = _s(message.get("id"))
+            second = int(created.timestamp())
+            keys = [f"t:{sender}:{second + d}" for d in (-1, 0, 1)]
+            if f"m:{mid}" in self.dedup._cache or any(k in self.dedup._cache for k in keys):
+                continue
+            self.dedup.seen(f"m:{mid}")
+            self.dedup.seen(keys[1])
+            ev = graph_message_to_event(message, own_id)
+            if ev is None:
+                continue
+            log.info("Inbox poll picked up a message the webhook did not deliver (mid=%s…)", mid[:12])
+            asyncio.create_task(_run_safely(self.handle_messaging_event, ev, own_id))
+
+    async def inbox_poll_loop(self) -> None:
+        if self.s.inbox_poll_sec <= 0 or not self.s.ig_account_id.isdigit():
+            return
+        not_before = datetime.now(timezone.utc) - timedelta(minutes=2)
+        backoff = 0
+        log.info("Inbox polling every %ss (catches DMs stuck in Message requests)", self.s.inbox_poll_sec)
+        while True:
+            try:
+                await self.poll_inbox_once(not_before)
+                backoff = 0
+            except (GraphAPIError, httpx.HTTPError) as exc:
+                backoff = min(backoff * 2 or 60, 900)
+                log.warning("Inbox poll failed (%s); next try in %ss", exc, self.s.inbox_poll_sec + backoff)
+            except Exception:  # noqa: BLE001
+                log.exception("Inbox poll crashed")
+            await asyncio.sleep(self.s.inbox_poll_sec + backoff)
 
     async def _music_branch(self, info: MediaInfo, workdir: Path, strict: bool) -> BranchResult:
         try:
@@ -1693,7 +1881,7 @@ class Bot:
                 await self.ig.subscribe_app(fields)
                 log.info("Instagram account %s subscribed to webhooks: %s", self.s.ig_account_id, fields)
                 return
-            except GraphAPIError as exc:
+            except (GraphAPIError, httpx.HTTPError) as exc:
                 log.warning("Webhook subscription with fields %s failed: %s", fields, exc)
         log.error("Could not subscribe the Instagram account to webhooks — check token permissions "
                   "(instagram_basic, instagram_manage_messages, instagram_manage_comments)")
@@ -1872,11 +2060,13 @@ async def lifespan(app: FastAPI):
     await bot.bootstrap_token()
     await bot.ensure_webhook_subscription()
     refresh_task = asyncio.create_task(bot.token_refresh_loop())
+    poll_task = asyncio.create_task(bot.inbox_poll_loop())
     log.info("Bot started (models: %s → %s)", settings.gemini_primary_model, settings.gemini_fallback_model)
     try:
         yield
     finally:
         refresh_task.cancel()
+        poll_task.cancel()
         await vision.aclose()
         await http.aclose()
         await db.close()
@@ -1957,9 +2147,12 @@ async def receive_webhook(request: Request, background: BackgroundTasks) -> Resp
             mid = _s((ev.get("message") or {}).get("mid") or (ev.get("postback") or {}).get("mid"))
             if not mid:
                 continue  # read receipts, reactions, typing, etc.
+            sender_id = _s((ev.get("sender") or {}).get("id"))
+            ts = int(ev.get("timestamp") or 0)
             if bot.dedup.seen(f"m:{mid}"):
                 log.info("Duplicate webhook ignored: %s", mid)
                 continue
+            bot.mark_seen_event(sender_id, ts)
             background.add_task(_run_safely, bot.handle_messaging_event, ev, own_id)
 
         for change in entry.get("changes") or []:
