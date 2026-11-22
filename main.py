@@ -128,6 +128,9 @@ class Settings:
     # Reel downloader (yt-dlp)
     ig_cookies: str
     download_proxy: str
+    # Shazam (second recogniser; better for phonk / TikTok-style remixes)
+    shazam_enabled: bool
+    ai_song_enabled: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -173,6 +176,9 @@ class Settings:
             # (http://user:pass@host:port) — only needed if Instagram starts blocking the server.
             ig_cookies=_env("IG_COOKIES", ""),
             download_proxy=_env("DOWNLOAD_PROXY", ""),
+            shazam_enabled=_env("SHAZAM_ENABLED", "1").lower() not in ("0", "false", "no"),
+            # Gemini listens to the audio when fingerprinting fails (remixes, covers, edits).
+            ai_song_enabled=_env("AI_SONG_ENABLED", "1").lower() not in ("0", "false", "no"),
         )
 
 
@@ -284,7 +290,7 @@ UNSUPPORTED_LINK_DOMAINS = (
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 FIND_KEYWORD_RE = re.compile(r"\bfind\b", re.IGNORECASE)
 
-BUILD = "2026-11-21 reel-downloader"  # shown in the startup log to confirm which code is deployed
+BUILD = "2026-11-21 music-v3"  # shown in the startup log to confirm which code is deployed
 IG_TEXT_LIMIT = 950  # Instagram text messages must be < 1000 characters
 
 
@@ -944,6 +950,10 @@ class ResolvedPost:
     dash_video: str = ""  # used only if no progressive format exists
     dash_audio: str = ""
     thumbnail: str = ""
+    caption: str = ""
+    music_title: str = ""    # Instagram's own audio label
+    music_artist: str = ""
+    music_original: bool = False  # True = "original audio" (user-uploaded), False = licensed track
 
 
 def pick_post_formats(info: dict) -> ResolvedPost:
@@ -951,8 +961,14 @@ def pick_post_formats(info: dict) -> ResolvedPost:
     if info.get("_type") == "playlist":  # carousel: first entry that has a video, else the first one
         entries = [e for e in (info.get("entries") or []) if e]
         with_video = [e for e in entries if e.get("formats") or e.get("url")]
-        info = (with_video or entries or [{}])[0]
-    out = ResolvedPost(thumbnail=_s(info.get("thumbnail")))
+        parent = info
+        info = dict((with_video or entries or [{}])[0])
+        for key in ("description", "ig_music"):
+            info.setdefault(key, parent.get(key))
+    music = info.get("ig_music") or {}
+    out = ResolvedPost(thumbnail=_s(info.get("thumbnail")), caption=_s(info.get("description"))[:600],
+                       music_title=_s(music.get("title")), music_artist=_s(music.get("artist")),
+                       music_original=bool(music.get("original")))
     formats = [f for f in (info.get("formats") or []) if _s(f.get("url")).startswith("http")]
     if not formats and _s(info.get("url")).startswith("http"):
         formats = [info]
@@ -981,6 +997,50 @@ def pick_post_formats(info: dict) -> ResolvedPost:
     if not videos and not audios and formats:
         out.video_url = formats[-1]["url"]
     return out
+
+
+def ig_music_from_product(product: dict) -> dict:
+    """Instagram's audio label from the raw media JSON: licensed track or 'original audio'."""
+    clips = (product or {}).get("clips_metadata") or {}
+    asset = (((clips.get("music_info") or {}).get("music_asset_info"))
+             or (((product or {}).get("music_metadata") or {}).get("music_info") or {}).get("music_asset_info")
+             or {})
+    if _s(asset.get("title")):
+        return {"title": _s(asset.get("title")), "artist": _s(asset.get("display_artist")), "original": False}
+    sound = clips.get("original_sound_info") or {}
+    if _s(sound.get("original_audio_title")):
+        return {"title": _s(sound.get("original_audio_title")),
+                "artist": _s((sound.get("ig_artist") or {}).get("username")), "original": True}
+    return {}
+
+
+_YTDL_HOOKED = False
+
+
+def _hook_ytdl_instagram() -> None:
+    """yt-dlp drops Instagram's music label; this keeps it as info['ig_music']."""
+    global _YTDL_HOOKED
+    if _YTDL_HOOKED:
+        return
+    _YTDL_HOOKED = True
+    try:
+        from yt_dlp.extractor.instagram import InstagramBaseIE
+
+        original = InstagramBaseIE._extract_product
+
+        def _extract_product(self, product_info, *args, **kwargs):  # noqa: ANN001
+            info = original(self, product_info, *args, **kwargs)
+            try:
+                raw = product_info[0] if isinstance(product_info, list) else product_info
+                if isinstance(info, dict) and isinstance(raw, dict):
+                    info["ig_music"] = ig_music_from_product(raw)
+            except Exception:  # noqa: BLE001
+                pass
+            return info
+
+        InstagramBaseIE._extract_product = _extract_product
+    except Exception as exc:  # noqa: BLE001 — never break downloads over metadata
+        log.warning("Could not hook yt-dlp Instagram music metadata: %s", exc)
 
 
 class _QuietYtdlLogger:
@@ -1022,6 +1082,8 @@ class ReelExtractor:
     def _extract_sync(self, url: str) -> dict:
         import yt_dlp  # imported lazily: heavy module
 
+        _hook_ytdl_instagram()
+
         opts: dict[str, Any] = {
             "quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": False,
             "socket_timeout": 10, "extractor_retries": 1, "logger": _QuietYtdlLogger(),
@@ -1044,9 +1106,12 @@ class ReelExtractor:
             reason = re.sub(r"\s+", " ", str(exc))[:300]
             raise MediaUnavailable(MSG_REEL_BLOCKED, f"reel extractor failed: {reason}") from exc
         post = pick_post_formats(info)
-        log.info("Reel resolved in %.1fs: progressive=%s dash_video=%s dash_audio=%s thumb=%s",
+        log.info("Reel resolved in %.1fs: progressive=%s dash_video=%s dash_audio=%s thumb=%s "
+                 "audio_label=%r (%s)",
                  asyncio.get_running_loop().time() - started, bool(post.video_url),
-                 bool(post.dash_video), bool(post.dash_audio), bool(post.thumbnail))
+                 bool(post.dash_video), bool(post.dash_audio), bool(post.thumbnail),
+                 f"{post.music_artist} — {post.music_title}"[:80] if post.music_title else "",
+                 "original" if post.music_original else "licensed")
         return post
 
     async def resolve(self, url: str) -> ResolvedPost:
@@ -1060,6 +1125,10 @@ class ReelExtractor:
         post = await asyncio.shield(task)
         self.cache[url] = post
         return post
+
+    def cached(self, url: str) -> ResolvedPost | None:
+        ig_url = instagram_post_url(url)
+        return self.cache.get(ig_url) if ig_url else None
 
     def prefetch(self, url: str) -> None:
         """Starts resolving while the user is still choosing a button."""
@@ -1083,7 +1152,7 @@ async def fetch_og_image(http: httpx.AsyncClient, page_url: str) -> str:
     """Cover image from the post page's Open Graph tags (what link previews use). '' if none."""
     try:
         async with http.stream("GET", page_url, headers={"User-Agent": DOWNLOAD_USER_AGENTS[-1]},
-                               timeout=httpx.Timeout(8.0, connect=4.0), follow_redirects=True) as resp:
+                               timeout=httpx.Timeout(8.0, connect=4.0), follow_redirects=False) as resp:
             if resp.status_code != 200:
                 return ""
             body = b""
@@ -1230,6 +1299,23 @@ async def extract_audio_clip(info: MediaInfo, workdir: Path) -> bytes:
     return out.read_bytes()
 
 
+async def extract_wav_clip(info: MediaInfo, workdir: Path, rate: float = 1.0) -> bytes:
+    """12 s mono 16 kHz WAV for Shazam. rate != 1 plays it faster/slower WITH pitch change:
+    that undoes "sped up" / "slowed" edits, so the original track can be matched."""
+    start = 1.0 if info.duration >= 14.0 else 0.0
+    out = workdir / f"shz_{rate:.2f}_{uuid.uuid4().hex[:6]}.wav"
+    af = ["-af", f"aresample=44100,asetrate={44100 * rate:.0f},aresample=16000"] if rate != 1.0 else []
+    rc, _, err = await run_cmd(
+        ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+         "-ss", f"{start:.2f}", "-i", str(info.path), "-vn", *af,
+         "-ac", "1", "-ar", "16000", "-t", "12", "-f", "wav", str(out)],
+        timeout=15,
+    )
+    if rc != 0 or not out.exists() or out.stat().st_size < 1000:
+        raise MediaUnavailable(MSG_UNSUPPORTED, f"wav extract failed: {err[:200]!r}")
+    return out.read_bytes()
+
+
 async def _grab_frame(src: Path, at: float, out: Path) -> bytes | None:
     """Grabs one frame. Fast path decodes only the nearest keyframe (~3x less CPU,
     matters on 0.1-0.5 vCPU free instances); falls back to an exact seek."""
@@ -1314,6 +1400,87 @@ class AudDClient:
         raise ExternalServiceError("AudD unreachable")
 
 
+def _norm(text: str) -> str:
+    text = re.sub(r"\(.*?\)|\[.*?\]", " ", text.lower())  # drop "(feat. X)", "[Remix]"
+    text = re.sub(r"\b(feat|ft|featuring|prod|remix|edit|version|sped up|slowed|reverb)\b.*", " ", text)
+    return re.sub(r"[^\w]+", " ", text).strip()
+
+
+def _similar(a: str, b: str) -> float:
+    from difflib import SequenceMatcher
+
+    a, b = _norm(a), _norm(b)
+    if not a or not b:
+        return 0.0
+    if a in b or b in a:
+        return 1.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+async def verify_song_itunes(http: httpx.AsyncClient, artist: str, title: str) -> dict | None:
+    """Checks that the AI's answer is a real released track (free iTunes Search API, no key).
+    Returns an AudD-shaped result with canonical names + Apple Music link, or None."""
+    try:
+        resp = await http.get("https://itunes.apple.com/search",
+                              params={"term": f"{artist} {title}"[:200], "entity": "song", "limit": 15},
+                              timeout=httpx.Timeout(5.0, connect=3.0))
+        items = resp.json().get("results") or [] if resp.status_code == 200 else []
+    except (httpx.HTTPError, ValueError) as exc:
+        log.info("iTunes verification unavailable: %s", exc)
+        return None
+    best, best_score = None, 0.0
+    for it in items:
+        t_score = _similar(title, _s(it.get("trackName")))
+        a_score = _similar(artist, _s(it.get("artistName")))
+        score = t_score * 0.6 + a_score * 0.4
+        if t_score >= 0.75 and a_score >= 0.6 and score > best_score:
+            best, best_score = it, score
+    if not best:
+        return None
+    return {
+        "artist": _s(best.get("artistName")), "title": _s(best.get("trackName")),
+        "album": _s(best.get("collectionName")), "release_date": _s(best.get("releaseDate"))[:10],
+        "apple_music": {"url": _s(best.get("trackViewUrl")).split("?")[0]},
+    }
+
+
+def shazam_to_result(track: dict) -> dict:
+    """Shazam `track` → the same shape format_song() expects from AudD."""
+    result: dict[str, Any] = {"title": _s(track.get("title")), "artist": _s(track.get("subtitle"))}
+    for section in track.get("sections") or []:
+        for meta in (section or {}).get("metadata") or []:
+            label = _s((meta or {}).get("title")).lower()
+            if label == "album":
+                result["album"] = _s(meta.get("text"))
+            elif label == "released":
+                result["release_date"] = _s(meta.get("text"))
+    if _s(track.get("url")).startswith("https://"):
+        result["song_link"] = track["url"]
+    return result
+
+
+class ShazamClient:
+    """Shazam via the open-source shazamio library (unofficial API, free). Never raises:
+    any problem simply counts as "not recognised", AudD stays the primary engine."""
+
+    def __init__(self, timeout: float = 8.0):
+        from shazamio import Shazam  # lazy: optional dependency
+
+        self._shazam = Shazam(segment_duration_seconds=12)
+        self._timeout = timeout
+
+    async def recognize(self, wav: bytes) -> dict | None:
+        try:
+            out = await asyncio.wait_for(self._shazam.recognize(wav), timeout=self._timeout)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Shazam failed: %s", re.sub(r"\s+", " ", str(exc))[:200] or type(exc).__name__)
+            return None
+        track = (out or {}).get("track")
+        if not track or not _s(track.get("title")):
+            return None
+        return shazam_to_result(track)
+
+
 # =============================================================================
 # Gemini Vision (google-genai) with model fallback
 # =============================================================================
@@ -1394,6 +1561,39 @@ PROMPTS = {
 
 RETRYABLE_GEMINI_CODES = {404, 408, 429, 499, 500, 502, 503, 504}
 
+SONG_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "found": {"type": "boolean"},
+        "artist": {"type": "string", "description": "Artist of the ORIGINAL released track"},
+        "title": {"type": "string", "description": "Title of the ORIGINAL released track"},
+        "version": {"type": "string", "description": "e.g. 'original', 'sped up', 'slowed', 'phonk remix', "
+                                                     "'cover', 'mashup'; empty if unsure"},
+        "confidence": {"type": "number", "description": "0..1 — how sure you are about artist+title"},
+        "evidence": {"type": "string", "description": "short: melody / lyrics heard / caption / audio label"},
+    },
+    "required": ["found", "artist", "title", "confidence"],
+}
+
+
+def song_prompt(caption: str, audio_label: str) -> str:
+    ctx = []
+    if audio_label:
+        ctx.append(f"Instagram audio label: {audio_label}")
+    if caption:
+        ctx.append(f"Reel caption: {caption}")
+    context = "\n".join(ctx) or "(no caption or audio label available)"
+    return (
+        "You are a music identification expert. Identify the song playing in this audio clip from an "
+        "Instagram Reel. Audio fingerprinting (Shazam) already failed, so it is probably a remix, "
+        "sped-up/slowed edit, phonk/funk edit, cover or mashup — identify the ORIGINAL track it is based on "
+        "(recognise the melody, hook, vocals, lyrics or sample).\n"
+        "Context (often names the track or credits it with 🎵, 'song:', '#songname'; may also be unrelated):\n"
+        f"{context}\n\n"
+        "Rules: never invent a song. If you can't name a real released track, return found=false. "
+        "confidence must reflect real certainty (0.9 = you clearly recognise it)."
+    )
+
 
 class VisionClient:
     def __init__(self, api_key: str, models: list[str], timeout_sec: float, thinking_level: str):
@@ -1421,6 +1621,14 @@ class VisionClient:
         prompt, schema = PROMPTS[task]
         contents: list[Any] = [genai_types.Part.from_bytes(data=f, mime_type="image/jpeg") for f in frames]
         contents.append(prompt)
+        return await self._generate(contents, schema)
+
+    async def identify_song(self, wav: bytes, caption: str, audio_label: str) -> dict:
+        contents: list[Any] = [genai_types.Part.from_bytes(data=wav, mime_type="audio/wav"),
+                               song_prompt(caption, audio_label)]
+        return await self._generate(contents, SONG_SCHEMA)
+
+    async def _generate(self, contents: list[Any], schema: dict) -> dict:
         last_error = "no models configured"
 
         for model in self._models:
@@ -1492,7 +1700,10 @@ def format_song(result: dict) -> str:
         f"https://open.spotify.com/search/{quote_plus(f'{artist} {title}')}"
     )
     apple = (result.get("apple_music") or {}).get("url") or f"https://music.apple.com/us/search?term={query}"
-    lines = ["🎵 Song found!", f"{artist} — {title}"]
+    lines = ["🎵 Song found!"]
+    if result.get("_note"):
+        lines.append(_s(result["_note"]))
+    lines.append(f"{artist} — {title}")
     if album:
         lines.append(f"💿 {album}" + (f" ({release[:4]})" if release else ""))
     lines += [f"▶️ Spotify: {spotify}", f"🍎 Apple Music: {apple}"]
@@ -1607,8 +1818,9 @@ class SearchOutcome:
 
 class Bot:
     def __init__(self, settings: Settings, http: httpx.AsyncClient, db: Database, ig: InstagramClient,
-                 audd: AudDClient, vision: VisionClient):
+                 audd: AudDClient, vision: VisionClient, shazam: ShazamClient | None = None):
         self.s = settings
+        self.shazam = shazam
         self.http = http
         self.db = db
         self.ig = ig
@@ -1887,7 +2099,8 @@ class Bot:
 
                 tasks: dict[str, Awaitable[BranchResult]] = {}
                 if action in (FIND_MUSIC, FIND_ALL):
-                    tasks["music"] = self._music_branch(info, workdir, strict=action == FIND_MUSIC)
+                    tasks["music"] = self._music_branch(info, workdir, strict=action == FIND_MUSIC,
+                                                        hint=self.reels.cached(media_url))
                 if action in (FIND_MOVIE, FIND_ITEM, FIND_ALL):
                     tasks["vision"] = self._vision_branch(action, info, workdir, strict=action != FIND_ALL)
 
@@ -2047,10 +2260,115 @@ class Bot:
                 log.exception("Inbox poll crashed")
             await asyncio.sleep(self.s.inbox_poll_sec + backoff)
 
-    async def _music_branch(self, info: MediaInfo, workdir: Path, strict: bool) -> BranchResult:
+    async def _shazam_once(self, info: MediaInfo, workdir: Path, rate: float = 1.0) -> dict | None:
+        if not self.shazam:
+            return None
         try:
-            mp3 = await extract_audio_clip(info, workdir)
-            result = await self.audd.recognize(mp3)
+            wav = await extract_wav_clip(info, workdir, rate)
+        except MediaUnavailable as exc:
+            log.info("Shazam clip skipped: %s", exc)
+            return None
+        return await self.shazam.recognize(wav)
+
+    async def _ai_song(self, info: MediaInfo, workdir: Path, caption: str, label: str) -> dict | None:
+        """Gemini listens to the clip (+ caption / audio label) → guess → verified in iTunes catalog."""
+        try:
+            wav = await extract_wav_clip(info, workdir)
+            data = await self.vision.identify_song(wav, caption, label)
+        except (MediaUnavailable, ExternalServiceError) as exc:
+            log.warning("AI song search failed: %s", exc)
+            return None
+        artist, title = _s(data.get("artist")), _s(data.get("title"))
+        try:
+            conf = float(data.get("confidence") or 0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        log.info("AI song guess: %r — %r version=%r conf=%.2f evidence=%r", artist, title,
+                 _s(data.get("version")), conf, _s(data.get("evidence"))[:120])
+        if not data.get("found") or not title or conf < 0.5:
+            return None
+        verified = await verify_song_itunes(self.http, artist, title)
+        if not verified:
+            log.info("AI guess not found in the Apple Music catalog → ignored")
+            return None
+        version = _s(data.get("version")).lower()
+        if version and version not in ("original", "unknown", "n/a", "none"):
+            verified["_note"] = f"🎛 This Reel uses a {version[:40]} of:"
+        elif conf < 0.8:
+            verified["_note"] = "🤔 Most likely:"
+        return verified
+
+    async def recognize_song(self, info: MediaInfo, workdir: Path,
+                             hint: ResolvedPost | None = None) -> dict | None:
+        """0) Instagram's licensed-track label → 1) AudD + Shazam race → 2) Shazam on sped-up /
+        slowed versions + Gemini listening (verified in the iTunes catalog).
+        Raises ExternalServiceError only if AudD failed AND nothing was found."""
+        mp3 = await extract_audio_clip(info, workdir)  # MediaUnavailable for photos / silent clips
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+
+        if hint and hint.music_title and not hint.music_original:
+            log.info("Song from the Instagram audio label: %s — %s", hint.music_artist, hint.music_title)
+            return {"artist": hint.music_artist, "title": hint.music_title}
+
+        label = ""
+        if hint and hint.music_title:
+            label = f"{hint.music_artist}: {hint.music_title} (user-uploaded original audio)"
+        ai_task = (asyncio.create_task(self._ai_song(info, workdir, hint.caption if hint else "", label))
+                   if self.s.ai_song_enabled else None)
+        try:
+            audd_task = asyncio.create_task(self.audd.recognize(mp3))
+            names = {audd_task: "AudD", asyncio.create_task(self._shazam_once(info, workdir)): "Shazam"}
+            for task in names:  # mark errors as retrieved even if the other engine wins first
+                task.add_done_callback(lambda t: t.cancelled() or t.exception())
+            pending: set[asyncio.Task] = set(names)
+            audd_error: BaseException | None = None
+            try:  # whichever fingerprint engine finds the song first wins
+                while pending:
+                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        if task.exception() is not None:
+                            if task is audd_task:
+                                audd_error = task.exception()
+                            else:
+                                log.warning("Shazam branch error: %s", task.exception())
+                            continue
+                        if task.result():
+                            log.info("Song found by %s in %.1fs", names[task], loop.time() - started)
+                            return task.result()
+            finally:
+                for task in pending:
+                    task.cancel()
+
+            if self.shazam:  # 0.8 / 0.88 undo "sped up" edits, 1.2 undoes "slowed + reverb"
+                rates = (0.8, 0.88, 1.2)
+                variants = await asyncio.gather(*(self._shazam_once(info, workdir, r) for r in rates),
+                                                return_exceptions=True)
+                for rate, res in zip(rates, variants, strict=True):
+                    if res and not isinstance(res, BaseException):
+                        log.info("Song found by Shazam at speed x%.2f in %.1fs", 1 / rate, loop.time() - started)
+                        res["_note"] = ("⚡ This Reel uses a sped-up version of:" if rate < 1
+                                        else "🐢 This Reel uses a slowed-down version of:")
+                        return res
+            if ai_task:
+                res = await ai_task
+                if res:
+                    log.info("Song found by AI (verified) in %.1fs", loop.time() - started)
+                    return res
+            log.info("Song not recognised (AudD %s, Shazam %s, AI %s) in %.1fs",
+                     "error" if audd_error else "miss", "miss" if self.shazam else "off",
+                     "miss" if ai_task else "off", loop.time() - started)
+            if audd_error:
+                raise audd_error
+            return None
+        finally:
+            if ai_task and not ai_task.done():
+                ai_task.cancel()
+
+    async def _music_branch(self, info: MediaInfo, workdir: Path, strict: bool,
+                            hint: ResolvedPost | None = None) -> BranchResult:
+        try:
+            result = await self.recognize_song(info, workdir, hint)
         except MediaUnavailable as exc:
             if strict:
                 raise
@@ -2313,7 +2631,13 @@ async def lifespan(app: FastAPI):
         settings.gemini_timeout_sec,
         settings.gemini_thinking_level,
     )
-    bot = Bot(settings, http, db, ig, audd, vision)
+    shazam: ShazamClient | None = None
+    if settings.shazam_enabled:
+        try:
+            shazam = ShazamClient()
+        except Exception as exc:  # noqa: BLE001 — Shazam is optional
+            log.warning("Shazam disabled: %s", exc)
+    bot = Bot(settings, http, db, ig, audd, vision, shazam)
     await bot.bootstrap_token()
     await bot.ensure_webhook_subscription()
     refresh_task = asyncio.create_task(bot.token_refresh_loop())
