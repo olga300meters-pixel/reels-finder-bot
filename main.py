@@ -104,6 +104,10 @@ class Settings:
     gemini_primary_model: str
     gemini_fallback_model: str
     gemini_timeout_sec: float
+    gemini_extra_models: str
+    backup_ai_url: str
+    backup_ai_key: str
+    backup_ai_model: str
     gemini_thinking_level: str
     # AudD
     audd_api_token: str
@@ -152,7 +156,15 @@ class Settings:
             gemini_api_key=_env("GEMINI_API_KEY", required=True),
             gemini_primary_model=_env("GEMINI_PRIMARY_MODEL", "gemini-2.5-flash"),
             gemini_fallback_model=_env("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite"),
-            gemini_timeout_sec=_env_float("GEMINI_TIMEOUT_SEC", 8.0),
+            # Per-attempt timeout; vision calls always get at least 12 s (item lists are long answers).
+            gemini_timeout_sec=_env_float("GEMINI_TIMEOUT_SEC", 12.0),
+            # Extra Gemini models tried after primary/fallback (comma list). Unknown names are skipped.
+            gemini_extra_models=_env("GEMINI_EXTRA_MODELS", "gemini-flash-latest,gemini-flash-lite-latest"),
+            # Optional second AI provider for photo/video tasks when ALL Gemini models fail.
+            # Any OpenAI-compatible API, e.g. OpenRouter: https://openrouter.ai/api/v1 + a vision model.
+            backup_ai_url=_env("BACKUP_AI_URL", "https://openrouter.ai/api/v1").rstrip("/"),
+            backup_ai_key=_env("BACKUP_AI_KEY", ""),
+            backup_ai_model=_env("BACKUP_AI_MODEL", ""),
             gemini_thinking_level=_env("GEMINI_THINKING_LEVEL", "low").upper(),
             audd_api_token=_env("AUDD_API_TOKEN", required=True),
             audd_timeout_sec=_env_float("AUDD_TIMEOUT_SEC", 8.0),
@@ -290,7 +302,7 @@ UNSUPPORTED_LINK_DOMAINS = (
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 FIND_KEYWORD_RE = re.compile(r"\bfind\b", re.IGNORECASE)
 
-BUILD = "2026-11-21 music-v3"  # shown in the startup log to confirm which code is deployed
+BUILD = "2026-11-22 buttons-ai-chain"  # shown in the startup log to confirm which code is deployed
 IG_TEXT_LIMIT = 950  # Instagram text messages must be < 1000 characters
 
 
@@ -1441,6 +1453,7 @@ async def verify_song_itunes(http: httpx.AsyncClient, artist: str, title: str) -
         "artist": _s(best.get("artistName")), "title": _s(best.get("trackName")),
         "album": _s(best.get("collectionName")), "release_date": _s(best.get("releaseDate"))[:10],
         "apple_music": {"url": _s(best.get("trackViewUrl")).split("?")[0]},
+        "_cover": _s(best.get("artworkUrl100")).replace("100x100", "600x600"),
     }
 
 
@@ -1456,6 +1469,9 @@ def shazam_to_result(track: dict) -> dict:
                 result["release_date"] = _s(meta.get("text"))
     if _s(track.get("url")).startswith("https://"):
         result["song_link"] = track["url"]
+    cover = _s((track.get("images") or {}).get("coverart"))
+    if cover.startswith("https://"):
+        result["_cover"] = cover
     return result
 
 
@@ -1596,17 +1612,28 @@ def song_prompt(caption: str, audio_label: str) -> str:
 
 
 class VisionClient:
-    def __init__(self, api_key: str, models: list[str], timeout_sec: float, thinking_level: str):
-        self._timeout = timeout_sec
-        self._models = [m for m in models if m]
+    TOTAL_BUDGET_SEC = 30.0  # whole fallback chain must fit in this
+
+    def __init__(self, api_key: str, models: list[str], timeout_sec: float, thinking_level: str,
+                 backup: tuple[str, str, str] | None = None):
+        self._timeout = max(timeout_sec, 12.0)
+        self._models = list(dict.fromkeys(m.strip() for m in models if m and m.strip()))  # dedupe, keep order
+        self._dead_models: set[str] = set()  # 404 "model not found" → don't try again
         self._thinking_level = thinking_level
+        self._backup = backup if backup and all(backup) else None
+        self._backup_http: httpx.AsyncClient | None = None
         self._client = genai.Client(
             api_key=api_key,
             http_options=genai_types.HttpOptions(
-                timeout=int(timeout_sec * 1000),
+                timeout=int(self._timeout * 1000),
                 retry_options=genai_types.HttpRetryOptions(attempts=1),
             ),
         )
+
+    @property
+    def describe(self) -> str:
+        chain = " → ".join(self._models)
+        return chain + (f" → backup {self._backup[2]}" if self._backup else "")
 
     def _thinking_config(self, model: str) -> genai_types.ThinkingConfig | None:
         m = model.lower()
@@ -1621,7 +1648,13 @@ class VisionClient:
         prompt, schema = PROMPTS[task]
         contents: list[Any] = [genai_types.Part.from_bytes(data=f, mime_type="image/jpeg") for f in frames]
         contents.append(prompt)
-        return await self._generate(contents, schema)
+        try:
+            return await self._generate(contents, schema)
+        except ExternalServiceError as exc:
+            if not self._backup:
+                raise
+            log.warning("%s → trying backup AI %s", exc, self._backup[2])
+            return await self._backup_generate(frames, prompt, schema, str(exc))
 
     async def identify_song(self, wav: bytes, caption: str, audio_label: str) -> dict:
         contents: list[Any] = [genai_types.Part.from_bytes(data=wav, mime_type="audio/wav"),
@@ -1630,8 +1663,16 @@ class VisionClient:
 
     async def _generate(self, contents: list[Any], schema: dict) -> dict:
         last_error = "no models configured"
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.TOTAL_BUDGET_SEC
 
         for model in self._models:
+            if model in self._dead_models:
+                continue
+            left = deadline - loop.time()
+            if left < 3:
+                last_error += " (time budget exhausted)"
+                break
             config = genai_types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_json_schema=schema,
@@ -1642,19 +1683,20 @@ class VisionClient:
             try:
                 resp = await asyncio.wait_for(
                     self._client.aio.models.generate_content(model=model, contents=contents, config=config),
-                    timeout=self._timeout,
+                    timeout=min(self._timeout, left),
                 )
             except asyncio.TimeoutError:
-                last_error = f"{model}: timeout {self._timeout}s"
+                last_error = f"{model}: timeout {min(self._timeout, left):.0f}s"
                 log.warning("Gemini %s timed out → fallback", model)
                 continue
             except genai_errors.APIError as exc:
-                last_error = f"{model}: HTTP {exc.code} {exc.message}"
-                if exc.code in RETRYABLE_GEMINI_CODES:
-                    log.warning("Gemini %s overloaded/unavailable (%s) → fallback", model, exc.code)
-                    continue
-                log.error("Gemini %s non-retryable error: %s", model, exc)
-                raise ExternalServiceError(last_error) from exc
+                # Any API error → next model (a 400 on one model can be a schema/feature gap that
+                # another model handles; 429 = this model's quota is used up, others have their own).
+                last_error = f"{model}: HTTP {exc.code} {_s(exc.message)[:200]}"
+                if exc.code == 404:
+                    self._dead_models.add(model)
+                log.warning("Gemini %s failed (%s) → next model", model, last_error)
+                continue
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_error = f"{model}: transport {exc}"
                 log.warning("Gemini %s transport error → fallback: %s", model, exc)
@@ -1674,7 +1716,37 @@ class VisionClient:
 
         raise ExternalServiceError(f"All Gemini models failed: {last_error}")
 
+    async def _backup_generate(self, frames: list[bytes], prompt: str, schema: dict, why: str) -> dict:
+        """Same task on an OpenAI-compatible vision model (OpenRouter, OpenAI, Groq, …)."""
+        import base64
+
+        url, key, model = self._backup  # type: ignore[misc]
+        if self._backup_http is None:
+            self._backup_http = httpx.AsyncClient(timeout=httpx.Timeout(25.0, connect=5.0))
+        content: list[dict] = [{"type": "text", "text": prompt + "\n\nReply with ONLY a JSON object "
+                                "that matches this JSON schema:\n" + json.dumps(schema)}]
+        content += [{"type": "image_url",
+                     "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(f).decode()}}
+                    for f in frames]
+        body = {"model": model, "messages": [{"role": "user", "content": content}],
+                "response_format": {"type": "json_object"}, "temperature": 0.2, "max_tokens": 2048}
+        try:
+            resp = await self._backup_http.post(f"{url}/chat/completions", json=body,
+                                                headers={"Authorization": f"Bearer {key}"})
+            data = resp.json()
+            if resp.status_code >= 400:
+                raise ExternalServiceError(f"backup AI HTTP {resp.status_code}: {str(data)[:200]}")
+            text = _s(((data.get("choices") or [{}])[0].get("message") or {}).get("content"))
+            text = re.sub(r"^```(?:json)?|```$", "", text.strip()).strip()
+            result = json.loads(text)
+        except (httpx.HTTPError, ValueError, AttributeError, IndexError) as exc:
+            raise ExternalServiceError(f"{why}; backup AI failed: {exc}") from exc
+        log.info("Backup AI %s answered", model)
+        return result
+
     async def aclose(self) -> None:
+        if self._backup_http is not None:
+            await self._backup_http.aclose()
         closer = getattr(self._client.aio, "aclose", None)
         if closer:
             try:
@@ -1692,7 +1764,57 @@ def _s(value: Any) -> str:
     return str(value).strip() if value is not None else ""
 
 
-def format_song(result: dict) -> str:
+def url_button(title: str, url: str) -> dict:
+    return {"type": "web_url", "title": title[:20], "url": url}
+
+
+def make_card(title: str, subtitle: str, buttons: list[dict], image: str = "") -> dict:
+    """One element of an Instagram generic template (tappable buttons — plain links in DMs often
+    aren't clickable for people who don't follow the account)."""
+    card: dict[str, Any] = {"title": title[:80] or "Result", "buttons": buttons[:3]}
+    if subtitle:
+        card["subtitle"] = subtitle[:80]
+    if image.startswith("https://"):
+        card["image_url"] = image
+    return card
+
+
+def cards_as_text(cards: list[dict]) -> str:
+    """Fallback when the template can't be sent: same links as plain text."""
+    lines: list[str] = []
+    for c in cards:
+        lines.append(c.get("title", ""))
+        lines += [f"  {b['title']}: {b['url']}" for b in c.get("buttons", [])]
+    return "\n".join(lines)
+
+
+def song_cover(result: dict) -> str:
+    cover = _s(result.get("_cover"))
+    if cover:
+        return cover
+    art = ((result.get("apple_music") or {}).get("artwork") or {}).get("url")
+    if art:
+        return _s(art).replace("{w}", "600").replace("{h}", "600")
+    images = (((result.get("spotify") or {}).get("album") or {}).get("images")) or []
+    return _s(images[0].get("url")) if images else ""
+
+
+def song_card(result: dict) -> dict:
+    artist, title = _s(result.get("artist")), _s(result.get("title"))
+    query = quote_plus(f"{artist} {title}")
+    spotify = ((result.get("spotify") or {}).get("external_urls") or {}).get("spotify") or (
+        f"https://open.spotify.com/search/{query}")
+    apple = (result.get("apple_music") or {}).get("url") or f"https://music.apple.com/us/search?term={query}"
+    album, release = _s(result.get("album")), _s(result.get("release_date"))
+    subtitle = album + (f" ({release[:4]})" if album and release else "")
+    return make_card(f"{artist} — {title}", subtitle, [
+        url_button("▶️ Spotify", spotify),
+        url_button("🍎 Apple Music", apple),
+        url_button("📺 YouTube", f"https://www.youtube.com/results?search_query={query}"),
+    ], song_cover(result))
+
+
+def format_song(result: dict, links: bool = True) -> str:
     artist, title = _s(result.get("artist")), _s(result.get("title"))
     album, release = _s(result.get("album")), _s(result.get("release_date"))
     query = quote_plus(f"{artist} {title}")
@@ -1706,9 +1828,10 @@ def format_song(result: dict) -> str:
     lines.append(f"{artist} — {title}")
     if album:
         lines.append(f"💿 {album}" + (f" ({release[:4]})" if release else ""))
-    lines += [f"▶️ Spotify: {spotify}", f"🍎 Apple Music: {apple}"]
-    if result.get("song_link"):
-        lines.append(f"🔗 All platforms: {result['song_link']}")
+    if links:
+        lines += [f"▶️ Spotify: {spotify}", f"🍎 Apple Music: {apple}"]
+        if result.get("song_link"):
+            lines.append(f"🔗 All platforms: {result['song_link']}")
     return "\n".join(lines)
 
 
@@ -1749,8 +1872,17 @@ def format_movie(data: dict) -> str:
     except (TypeError, ValueError):
         conf = 0.0
     lines.append(f"🎯 Confidence: {'high' if conf >= 0.8 else 'medium'}")
-    lines.append(f"🔎 IMDb: https://www.imdb.com/find/?q={quote_plus(f'{title} {year}'.strip())}")
     return "\n".join(lines)
+
+
+def movie_card(data: dict) -> dict:
+    title, year = _s(data.get("title")), _s(data.get("year"))
+    q = quote_plus(f"{title} {year}".strip())
+    return make_card(f"🎬 {title}" + (f" ({year})" if year else ""), "Where to watch & details", [
+        url_button("📺 Where to watch", f"https://www.justwatch.com/us/search?q={quote_plus(title)}"),
+        url_button("⭐ IMDb", f"https://www.imdb.com/find/?q={q}"),
+        url_button("🎞 Trailer", f"https://www.youtube.com/results?search_query={q}+trailer"),
+    ])
 
 
 def filter_items(data: dict) -> list[dict]:
@@ -1775,10 +1907,22 @@ def format_items(items: list[dict]) -> str:
         lines.append(f"{i}. {name}" + (f" — {details}" if details else ""))
         if _s(it.get("description")):
             lines.append(f"   {_s(it.get('description'))}")
-        q = _s(it.get("search_query"))
-        lines.append(f"   🔎 “{q}”")
-        lines.append(f"   🛍 https://www.google.com/search?tbm=shop&q={quote_plus(q)}")
+        lines.append(f"   🔎 “{_s(it.get('search_query'))}”")
     return "\n".join(lines)
+
+
+def item_cards(items: list[dict]) -> list[dict]:
+    cards = []
+    for i, it in enumerate(items, 1):
+        q = _s(it.get("search_query"))
+        brand = _s(it.get("brand"))
+        brand = "" if brand.lower() in ("unknown", "n/a", "none") else brand
+        name = " ".join(x for x in (brand, _s(it.get("model"))) if x) or _s(it.get("category")).capitalize()
+        cards.append(make_card(f"{i}. {name}", f"🔎 {q}", [
+            url_button("🛍 Google Shopping", f"https://www.google.com/search?tbm=shop&q={quote_plus(q)}"),
+            url_button("📦 Amazon", f"https://www.amazon.com/s?k={quote_plus(q)}"),
+        ]))
+    return cards
 
 
 # =============================================================================
@@ -1792,6 +1936,7 @@ class BranchResult:
     text: str = ""
     failed: bool = False   # upstream API failure (do not charge for it)
     skipped: bool = False  # branch could not run (e.g. photo has no audio)
+    cards: list[dict] = field(default_factory=list)  # tappable link buttons
 
 
 @dataclass
@@ -2076,8 +2221,18 @@ class Bot:
 
                 blocks = [b.text for b in outcome.branches.values() if b.text]
                 blocks.append(footer)
-                blocks.append("Want something else from this Reel? 👇")
-                await self.safe_send(igsid, "\n\n".join(blocks), QUICK_REPLIES)
+                cards = [c for b in outcome.branches.values() for c in b.cards][:10]
+                if not cards:
+                    blocks.append("Want something else from this Reel? 👇")
+                    await self.safe_send(igsid, "\n\n".join(blocks), QUICK_REPLIES)
+                    return
+                await self.safe_send(igsid, "\n\n".join(blocks))
+                try:
+                    await self.ig.send_generic_template(igsid, cards)
+                except GraphAPIError as exc:
+                    log.warning("Link buttons failed (%s) → sending links as text", exc)
+                    await self.safe_send(igsid, cards_as_text(cards))
+                await self.safe_send(igsid, "Want something else from this Reel? 👇", QUICK_REPLIES)
             except Exception:  # noqa: BLE001 — never leave the user hanging
                 log.exception("Unexpected error while handling %s for %s", action, igsid)
                 await self.safe_send(igsid, MSG_OVERLOAD)
@@ -2381,7 +2536,7 @@ class Bot:
             return BranchResult(failed=True)
         if not result:
             return BranchResult(found=False)
-        return BranchResult(found=True, text=format_song(result))
+        return BranchResult(found=True, text=format_song(result, links=False), cards=[song_card(result)])
 
     async def _vision_branch(self, action: str, info: MediaInfo, workdir: Path, strict: bool) -> BranchResult:
         try:
@@ -2398,20 +2553,25 @@ class Bot:
             return BranchResult(failed=True)
 
         if action == FIND_MOVIE:
-            return BranchResult(found=True, text=format_movie(data)) if movie_is_found(data) else BranchResult()
+            return (BranchResult(found=True, text=format_movie(data), cards=[movie_card(data)])
+                    if movie_is_found(data) else BranchResult())
         if action == FIND_ITEM:
             items = filter_items(data)
-            return BranchResult(found=True, text=format_items(items)) if items else BranchResult()
+            return (BranchResult(found=True, text=format_items(items), cards=item_cards(items))
+                    if items else BranchResult())
 
         # FIND_ALL
         parts: list[str] = []
+        cards: list[dict] = []
         movie = data.get("movie") or {}
         if movie_is_found(movie):
             parts.append(format_movie(movie))
+            cards.append(movie_card(movie))
         items = filter_items(data.get("items") or {})
         if items:
             parts.append(format_items(items))
-        return BranchResult(found=bool(parts), text="\n\n".join(parts))
+            cards += item_cards(items)
+        return BranchResult(found=bool(parts), text="\n\n".join(parts), cards=cards)
 
     # ---------------------------------------------------------------- payments
 
@@ -2627,9 +2787,11 @@ async def lifespan(app: FastAPI):
     audd = AudDClient(http, settings.audd_api_token, settings.audd_timeout_sec)
     vision = VisionClient(
         settings.gemini_api_key,
-        [settings.gemini_primary_model, settings.gemini_fallback_model],
+        [settings.gemini_primary_model, settings.gemini_fallback_model,
+         *settings.gemini_extra_models.split(",")],
         settings.gemini_timeout_sec,
         settings.gemini_thinking_level,
+        backup=(settings.backup_ai_url, settings.backup_ai_key, settings.backup_ai_model),
     )
     shazam: ShazamClient | None = None
     if settings.shazam_enabled:
@@ -2642,8 +2804,7 @@ async def lifespan(app: FastAPI):
     await bot.ensure_webhook_subscription()
     refresh_task = asyncio.create_task(bot.token_refresh_loop())
     poll_task = asyncio.create_task(bot.inbox_poll_loop())
-    log.info("Bot started [build %s] (models: %s → %s)", BUILD, settings.gemini_primary_model,
-             settings.gemini_fallback_model)
+    log.info("Bot started [build %s] (AI chain: %s)", BUILD, vision.describe)
     try:
         yield
     finally:
