@@ -159,13 +159,13 @@ class Settings:
             # Per-attempt timeout; vision calls always get at least 12 s (item lists are long answers).
             gemini_timeout_sec=_env_float("GEMINI_TIMEOUT_SEC", 12.0),
             # Extra Gemini models tried after primary/fallback (comma list). Unknown names are skipped.
-            gemini_extra_models=_env("GEMINI_EXTRA_MODELS", "gemini-flash-latest,gemini-flash-lite-latest"),
+            gemini_extra_models=_env("GEMINI_EXTRA_MODELS", ""),
             # Optional second AI provider for photo/video tasks when ALL Gemini models fail.
             # Any OpenAI-compatible API, e.g. OpenRouter: https://openrouter.ai/api/v1 + a vision model.
             backup_ai_url=_env("BACKUP_AI_URL", "https://openrouter.ai/api/v1").rstrip("/"),
             backup_ai_key=_env("BACKUP_AI_KEY", ""),
             backup_ai_model=_env("BACKUP_AI_MODEL", ""),
-            gemini_thinking_level=_env("GEMINI_THINKING_LEVEL", "low").upper(),
+            gemini_thinking_level=_env("GEMINI_THINKING_LEVEL", "minimal").upper(),
             audd_api_token=_env("AUDD_API_TOKEN", required=True),
             audd_timeout_sec=_env_float("AUDD_TIMEOUT_SEC", 8.0),
             lemon_checkout_url=_env("LEMON_CHECKOUT_URL", ""),  # empty = payments off
@@ -302,7 +302,7 @@ UNSUPPORTED_LINK_DOMAINS = (
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 FIND_KEYWORD_RE = re.compile(r"\bfind\b", re.IGNORECASE)
 
-BUILD = "2026-11-22 buttons-ai-chain"  # shown in the startup log to confirm which code is deployed
+BUILD = "2026-11-22 fast-ai"  # shown in the startup log to confirm which code is deployed
 IG_TEXT_LIMIT = 950  # Instagram text messages must be < 1000 characters
 
 
@@ -1611,8 +1611,13 @@ def song_prompt(caption: str, audio_label: str) -> str:
     )
 
 
+class _ModelFailed(Exception):
+    pass
+
+
 class VisionClient:
-    TOTAL_BUDGET_SEC = 30.0  # whole fallback chain must fit in this
+    TOTAL_BUDGET_SEC = 25.0  # whole fallback chain must fit in this
+    HEDGE_SEC = 5.0          # no answer after this → start the next model in parallel
 
     def __init__(self, api_key: str, models: list[str], timeout_sec: float, thinking_level: str,
                  backup: tuple[str, str, str] | None = None):
@@ -1640,7 +1645,7 @@ class VisionClient:
         if m.startswith("gemini-2.5-flash"):
             return genai_types.ThinkingConfig(thinking_budget=0)  # no thinking => lowest latency
         if m.startswith("gemini-3"):
-            level = getattr(genai_types.ThinkingLevel, self._thinking_level, genai_types.ThinkingLevel.LOW)
+            level = getattr(genai_types.ThinkingLevel, self._thinking_level, genai_types.ThinkingLevel.MINIMAL)
             return genai_types.ThinkingConfig(thinking_level=level)
         return None
 
@@ -1661,60 +1666,127 @@ class VisionClient:
                                song_prompt(caption, audio_label)]
         return await self._generate(contents, SONG_SCHEMA)
 
-    async def _generate(self, contents: list[Any], schema: dict) -> dict:
-        last_error = "no models configured"
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + self.TOTAL_BUDGET_SEC
-
-        for model in self._models:
-            if model in self._dead_models:
-                continue
-            left = deadline - loop.time()
-            if left < 3:
-                last_error += " (time budget exhausted)"
-                break
+    async def _call_model(self, model: str, contents: list[Any], schema: dict, timeout: float) -> dict:
+        """One Gemini attempt. Returns parsed JSON or raises _ModelFailed(reason)."""
+        started = asyncio.get_running_loop().time()
+        tuned = True  # minimal thinking + medium image detail = much faster; plain call if rejected
+        for attempt in (1, 2):
+            extra: dict[str, Any] = {}
+            if tuned:
+                extra = {"thinking_config": self._thinking_config(model),
+                         "media_resolution": genai_types.MediaResolution.MEDIA_RESOLUTION_MEDIUM}
             config = genai_types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_json_schema=schema,
                 temperature=0.2,
                 max_output_tokens=2048,
-                thinking_config=self._thinking_config(model),
+                **extra,
             )
             try:
                 resp = await asyncio.wait_for(
                     self._client.aio.models.generate_content(model=model, contents=contents, config=config),
-                    timeout=min(self._timeout, left),
+                    timeout=timeout,
                 )
-            except asyncio.TimeoutError:
-                last_error = f"{model}: timeout {min(self._timeout, left):.0f}s"
-                log.warning("Gemini %s timed out → fallback", model)
-                continue
+            except asyncio.TimeoutError as exc:
+                raise _ModelFailed(f"{model}: timeout {timeout:.0f}s") from exc
             except genai_errors.APIError as exc:
-                # Any API error → next model (a 400 on one model can be a schema/feature gap that
-                # another model handles; 429 = this model's quota is used up, others have their own).
-                last_error = f"{model}: HTTP {exc.code} {_s(exc.message)[:200]}"
+                msg = _s(exc.message)
+                if exc.code == 400 and tuned and attempt == 1:
+                    log.info("Gemini %s rejected speed settings (%s) → plain call", model, msg[:120])
+                    tuned = False
+                    continue
                 if exc.code == 404:
                     self._dead_models.add(model)
-                log.warning("Gemini %s failed (%s) → next model", model, last_error)
-                continue
+                raise _ModelFailed(f"{model}: HTTP {exc.code} {msg[:160]}") from exc
             except (httpx.TimeoutException, httpx.TransportError) as exc:
-                last_error = f"{model}: transport {exc}"
-                log.warning("Gemini %s transport error → fallback: %s", model, exc)
-                continue
-
+                raise _ModelFailed(f"{model}: transport {exc}") from exc
             text = (resp.text or "").strip()
             if not text:
-                last_error = f"{model}: empty/blocked response"
-                log.warning("Gemini %s returned empty response → fallback", model)
-                continue
+                raise _ModelFailed(f"{model}: empty/blocked response")
             try:
-                return json.loads(text)
-            except json.JSONDecodeError:
-                last_error = f"{model}: invalid JSON"
-                log.warning("Gemini %s returned invalid JSON → fallback", model)
-                continue
+                data = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise _ModelFailed(f"{model}: invalid JSON") from exc
+            log.info("Gemini %s answered in %.1fs", model, asyncio.get_running_loop().time() - started)
+            return data
+        raise _ModelFailed(f"{model}: request rejected")
 
-        raise ExternalServiceError(f"All Gemini models failed: {last_error}")
+    async def _generate(self, contents: list[Any], schema: dict) -> dict:
+        """Hedged fallback chain: start the 1st model; if it is slow (> HEDGE_SEC) or fails, start the
+        next one in parallel; the first good answer wins, the rest are cancelled."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.TOTAL_BUDGET_SEC
+        queue = [m for m in self._models if m not in self._dead_models]
+        errors: list[str] = []
+        pending: dict[asyncio.Task, str] = {}
+
+        def start_next() -> bool:
+            left = deadline - loop.time()
+            if not queue or left < 3:
+                return False
+            model = queue.pop(0)
+            task = asyncio.create_task(self._call_model(model, contents, schema, min(self._timeout, left)))
+            pending[task] = model
+            return True
+
+        start_next()
+        try:
+            while pending:
+                wait_for = self.HEDGE_SEC if queue else max(deadline - loop.time(), 0.1)
+                done, _ = await asyncio.wait(set(pending), timeout=wait_for,
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if not done:  # current model(s) slow → hedge with the next one
+                    if queue:
+                        log.info("Gemini %s is slow → also asking %s", ", ".join(pending.values()), queue[0])
+                        start_next()
+                    elif loop.time() >= deadline:
+                        break
+                    continue
+                for task in done:
+                    model = pending.pop(task)
+                    exc = task.exception()
+                    if exc is None:
+                        return task.result()
+                    errors.append(str(exc))
+                    log.warning("Gemini %s failed (%s)", model, exc)
+                    if not pending:
+                        start_next()
+        finally:
+            for task in pending:
+                task.cancel()
+        raise ExternalServiceError("All Gemini models failed: " + ("; ".join(errors[-4:]) or "no models"))
+
+    async def discover_models(self) -> None:
+        """Adds Flash models that really exist for this API key to the end of the chain
+        (names change between Gemini generations; a wrong name in settings is skipped)."""
+        try:
+            pager = await asyncio.wait_for(self._client.aio.models.list(), timeout=8)
+            names = []
+            async for m in pager:
+                name = _s(m.name).removeprefix("models/")
+                actions = m.supported_actions or []
+                if "generateContent" in actions and "flash" in name:
+                    names.append(name)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not list Gemini models: %s", exc)
+            return
+        bad = ("tts", "image", "live", "audio", "embed", "robotics", "computer", "exp", "8b", "native")
+        usable = [n for n in names if not any(b in n for b in bad)]
+        if not usable:
+            return
+        self._dead_models |= {m for m in self._models if m not in names}
+
+        def rank(n: str) -> tuple:
+            ver = re.search(r"(\d+(?:\.\d+)?)", n)
+            return ("preview" in n, -(float(ver.group(1)) if ver else 0), "lite" not in n, n)
+
+        configured = [m for m in self._models if m in names]
+        extra = [n for n in sorted(usable, key=rank) if n not in configured]
+        self._models = (configured + extra)[: max(4, len(configured))]
+        log.info("Gemini models available: %s", ", ".join(sorted(usable)))
+        if self._dead_models:
+            log.warning("Gemini models from settings that don't exist (skipped): %s",
+                        ", ".join(sorted(self._dead_models)))
 
     async def _backup_generate(self, frames: list[bytes], prompt: str, schema: dict, why: str) -> dict:
         """Same task on an OpenAI-compatible vision model (OpenRouter, OpenAI, Groq, …)."""
@@ -2804,6 +2876,7 @@ async def lifespan(app: FastAPI):
     await bot.ensure_webhook_subscription()
     refresh_task = asyncio.create_task(bot.token_refresh_loop())
     poll_task = asyncio.create_task(bot.inbox_poll_loop())
+    await vision.discover_models()
     log.info("Bot started [build %s] (AI chain: %s)", BUILD, vision.describe)
     try:
         yield
