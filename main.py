@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import string
 import uuid
@@ -130,6 +131,7 @@ class Settings:
     tmp_root: str
     allow_private_urls: bool
     # Reel downloader (yt-dlp)
+    admin_code: str
     ig_cookies: str
     download_proxy: str
     # Shazam (second recogniser; better for phonk / TikTok-style remixes)
@@ -186,6 +188,9 @@ class Settings:
             allow_private_urls=_env("ALLOW_PRIVATE_URLS", "").lower() in ("1", "true", "yes"),
             # Optional: cookies.txt of a spare Instagram account (raw or base64) and a proxy
             # (http://user:pass@host:port) — only needed if Instagram starts blocking the server.
+            # Secret for the DM command "admin <code> <credits>" (adds test credits to yourself).
+            # Empty = admin command disabled. Use 16+ random characters.
+            admin_code=_env("ADMIN_CODE", ""),
             ig_cookies=_env("IG_COOKIES", ""),
             download_proxy=_env("DOWNLOAD_PROXY", ""),
             shazam_enabled=_env("SHAZAM_ENABLED", "1").lower() not in ("0", "false", "no"),
@@ -223,6 +228,7 @@ TEXT_COMMANDS = {
 }
 BALANCE_COMMANDS = {"balance", "credits", "status", "my credits"}
 BUY_COMMANDS = {"buy", "upgrade", "pricing", "premium", "subscribe", "pay"}
+PROMO_RE = re.compile(r"[A-Z0-9][A-Z0-9_-]{2,23}")
 DELETE_COMMANDS = {"delete my data", "delete data", "delete my account", "remove my data"}
 MSG_DATA_DELETED = (
     "Done ✅ Your data has been deleted: your ID, balance, subscription and last media link.\n"
@@ -302,7 +308,7 @@ UNSUPPORTED_LINK_DOMAINS = (
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 FIND_KEYWORD_RE = re.compile(r"\bfind\b", re.IGNORECASE)
 
-BUILD = "2026-11-22 fast-ai"  # shown in the startup log to confirm which code is deployed
+BUILD = "2026-11-22 promo"  # shown in the startup log to confirm which code is deployed
 IG_TEXT_LIMIT = 950  # Instagram text messages must be < 1000 characters
 
 
@@ -417,12 +423,30 @@ CREATE TABLE IF NOT EXISTS app_kv (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS promo_codes (
+    code        TEXT PRIMARY KEY,
+    credits     INT  NOT NULL,
+    max_uses    INT  NOT NULL,
+    used        INT  NOT NULL DEFAULT 0,
+    expires_at  TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS promo_redemptions (
+    code        TEXT NOT NULL,
+    id_hash     TEXT NOT NULL,          -- hashed user id: survives "delete my data", no plain id kept
+    redeemed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (code, id_hash)
+);
+
 -- Supabase exposes the public schema through its REST "Data API". Row Level Security with no
 -- policies closes that door; the bot connects as the table owner and is not affected.
 ALTER TABLE users          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE payment_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE deleted_users  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app_kv         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE promo_codes    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE promo_redemptions ENABLE ROW LEVEL SECURITY;
 """
 
 
@@ -534,6 +558,53 @@ class Database:
             media_type,
             mid or None,
         )
+
+    async def create_promo(self, code: str, credits: int, max_uses: int, days: int | None) -> bool:
+        assert self.pool
+        res = await self.pool.execute(
+            """INSERT INTO promo_codes (code, credits, max_uses, expires_at)
+               VALUES ($1, $2::int, $3::int, CASE WHEN $4::int IS NULL THEN NULL
+                                             ELSE now() + make_interval(days => $4::int) END)
+               ON CONFLICT (code) DO NOTHING""", code, credits, max_uses, days)
+        return res.endswith("1")
+
+    async def list_promos(self) -> list[asyncpg.Record]:
+        assert self.pool
+        return await self.pool.fetch(
+            """SELECT * FROM promo_codes WHERE used < max_uses AND (expires_at IS NULL OR expires_at > now())
+               ORDER BY created_at DESC LIMIT 20""")
+
+    async def disable_promo(self, code: str) -> bool:
+        assert self.pool
+        res = await self.pool.execute("UPDATE promo_codes SET max_uses = used WHERE code = $1", code)
+        return res.endswith("1")
+
+    async def redeem_promo(self, igsid: str, code: str) -> tuple[str, int, int]:
+        """→ (status, credits_added, new_balance). status: ok | unknown | used | expired."""
+        assert self.pool
+        async with self.pool.acquire() as conn, conn.transaction():
+            promo = await conn.fetchrow("SELECT * FROM promo_codes WHERE code = $1 FOR UPDATE", code)
+            if not promo:
+                return "unknown", 0, 0
+            if promo["used"] >= promo["max_uses"] or (
+                    promo["expires_at"] and promo["expires_at"] <= datetime.now(timezone.utc)):
+                return "expired", 0, 0
+            inserted = await conn.execute(
+                "INSERT INTO promo_redemptions (code, id_hash) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                code, self._id_hash(igsid))
+            if not inserted.endswith("1"):
+                return "used", 0, 0
+            await conn.execute("UPDATE promo_codes SET used = used + 1 WHERE code = $1", code)
+            balance = await conn.fetchval(
+                "UPDATE users SET credits = credits + $2::int, updated_at = now() WHERE igsid = $1 RETURNING credits",
+                igsid, promo["credits"])
+            return "ok", promo["credits"], balance or 0
+
+    async def add_credits(self, igsid: str, amount: int) -> int:
+        assert self.pool
+        return await self.pool.fetchval(
+            "UPDATE users SET credits = credits + $2::int, updated_at = now() WHERE igsid = $1 RETURNING credits",
+            igsid, amount)
 
     async def charge(self, igsid: str, cost: int) -> int | None:
         """Atomically deducts credits. Returns the new balance or None if insufficient."""
@@ -2047,6 +2118,8 @@ class Bot:
         self.locks = UserLocks()
         self.jobs = asyncio.Semaphore(settings.max_parallel_jobs)
         self.seen_accounts: set[str] = set()
+        self.admin_fails: dict[str, int] = {}
+        self.redeem_fails: dict[str, int] = {}
         self.reels = ReelExtractor(settings.ig_cookies, settings.download_proxy, settings.tmp_root)
 
     # ---------------------------------------------------------------- helpers
@@ -2225,13 +2298,95 @@ class Bot:
             return
 
         user = await self.db.get_or_create_user(igsid)
+        if lowered.startswith("admin ") and await self.handle_admin(igsid, clean):
+            return
         if lowered in BALANCE_COMMANDS:
             await self.safe_send(igsid, self.balance_line(user))
             return
         if lowered in BUY_COMMANDS:
             await self.send_paywall(igsid, user, 1)
             return
+        if await self.try_redeem(igsid, clean):
+            return
         await self.safe_send(igsid, welcome_text(self.s.bot_name, self.balance_line(user)))
+
+    async def handle_admin(self, igsid: str, text: str) -> bool:
+        """Secret DM commands (wrong code = ordinary text; 5 wrong tries lock the sender out):
+          admin <code> 500                     → +500 credits to yourself (max 10000)
+          admin <code> gift 50                 → one-time code worth 50 credits, to send to a friend
+          admin <code> promo SUMMER 10 100 7   → code SUMMER: 10 credits, 100 people, valid 7 days
+          admin <code> codes                   → list active codes
+          admin <code> off SUMMER              → disable a code"""
+        code = self.s.admin_code
+        if len(code) < 12 or self.admin_fails.get(igsid, 0) >= 5:
+            return False
+        parts = text.split()
+        if len(parts) < 2 or not hmac.compare_digest(parts[1].encode(), code.encode()):
+            self.admin_fails[igsid] = self.admin_fails.get(igsid, 0) + 1
+            log.warning("Wrong admin code from %s (%d/5)", igsid, self.admin_fails[igsid])
+            return False
+        args = parts[2:]
+        sub = args[0].lower() if args else ""
+
+        def num(i: int, default: int, hi: int) -> int:
+            return max(1, min(int(args[i]), hi)) if len(args) > i and args[i].isdigit() else default
+
+        if sub == "gift":
+            credits = num(1, 10, 10_000)
+            gift = "GIFT-" + secrets.token_hex(4).upper()
+            await self.db.create_promo(gift, credits, 1, 30)
+            log.info("Admin: gift code %s for %d credits", gift, credits)
+            await self.safe_send(igsid, f"🎁 Gift code for {credits} credits (1 person, 30 days):")
+            await self.safe_send(igsid, gift)  # separate message = easy to copy & forward
+            await self.safe_send(igsid, "Your friend just sends this code to me in DM.")
+        elif sub == "promo":
+            name = args[1].upper() if len(args) > 1 else ""
+            if not PROMO_RE.fullmatch(name):
+                await self.safe_send(igsid, "Promo name: 3–24 letters/digits, e.g. SUMMER")
+                return True
+            credits, uses = num(2, 5, 10_000), num(3, 100, 1_000_000)
+            days = num(4, 0, 3650) if len(args) > 4 else None
+            ok = await self.db.create_promo(name, credits, uses, days)
+            await self.safe_send(igsid, (
+                f"✅ Promo {name}: {credits} credits, up to {uses} people"
+                + (f", {days} days" if days else ", no expiry")
+                + "\nPeople just send the code to me in DM.") if ok else f"⚠️ Code {name} already exists")
+        elif sub == "codes":
+            rows = await self.db.list_promos()
+            lines = [f"{r['code']}: {r['credits']} cr, used {r['used']}/{r['max_uses']}"
+                     + (f", until {r['expires_at']:%b %d}" if r["expires_at"] else "") for r in rows]
+            await self.safe_send(igsid, "🎟 Active codes:\n" + ("\n".join(lines) or "none"))
+        elif sub == "off" and len(args) > 1:
+            ok = await self.db.disable_promo(args[1].upper())
+            await self.safe_send(igsid, f"⛔ {args[1].upper()} disabled" if ok else "Code not found")
+        else:
+            amount = num(0, 100, 10_000)
+            balance = await self.db.add_credits(igsid, amount)
+            log.info("Admin: +%d credits to %s (now %d)", amount, igsid, balance)
+            await self.safe_send(igsid, f"🛠 Admin: +{amount} credits added.\n💳 Credits left: {balance}")
+        return True
+
+    async def try_redeem(self, igsid: str, text: str) -> bool:
+        """A message that is just a promo/gift code → credits. Unknown code → False (normal reply)."""
+        token = text.strip().upper()
+        if token.startswith("REDEEM "):
+            token = token[7:].strip()
+        if not PROMO_RE.fullmatch(token) or self.redeem_fails.get(igsid, 0) >= 20:
+            return False
+        status, credits, balance = await self.db.redeem_promo(igsid, token)
+        if status == "unknown":
+            if token.startswith("GIFT-"):  # only guessing of private gift codes is rate-limited
+                self.redeem_fails[igsid] = self.redeem_fails.get(igsid, 0) + 1
+            return False
+        log.info("Promo %s → %s for %s", token, status, igsid)
+        msg = {
+            "ok": f"🎁 Code applied: +{credits} credits!\n💳 Credits left: {balance}\n\n"
+                  "Send me a Reel to use them 👇",
+            "used": "You've already used this code 🙂",
+            "expired": "This code has expired or run out 😕",
+        }[status]
+        await self.safe_send(igsid, msg)
+        return True
 
     async def handle_comment(self, value: dict, own_id: str) -> None:
         text = _s(value.get("text"))
