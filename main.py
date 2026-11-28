@@ -254,10 +254,17 @@ INVITE = "INVITE"
 LIST_KINDS = ("song", "movie", "item", "place")
 
 
-def followup_replies(done: str) -> list[dict] | None:
-    """Buttons after a search: the other single searches + My lists. None after 'Find everything'."""
+def default_replies() -> list[dict]:
+    """The two buttons that always make sense: your saved finds and free credits via invites."""
+    return [{"content_type": "text", "title": "📚 My lists", "payload": MY_LISTS},
+            {"content_type": "text", "title": "🎁 Invite friends", "payload": INVITE}]
+
+
+def followup_replies(done: str) -> list[dict]:
+    """Buttons after a search: the other single searches + My lists; after 'Find everything' only
+    the two default buttons."""
     if done == FIND_ALL:
-        return None
+        return default_replies()
     return [q for q in QUICK_REPLIES if q["payload"] not in (done, FIND_ALL)]
 
 # =============================================================================
@@ -607,6 +614,12 @@ _L("Payments are temporarily unavailable. Please try again in a few minutes.",
    "I pagamenti non sono disponibili al momento. Riprova tra qualche minuto.",
    "Оплата тимчасово недоступна. Спробуй за кілька хвилин.", "Оплата временно недоступна. Попробуй через несколько минут.")
 
+_L("📚 Saved to My lists", "📚 Guardado en Mis listas", "📚 Salvo em Minhas listas", "📚 In Meine Listen gespeichert",
+   "📚 Enregistré dans Mes listes", "📚 Salvato nelle mie liste", "📚 Збережено в «Мої списки»",
+   "📚 Сохранено в «Мои списки»")
+_L("🔍 Search by photo", "🔍 Buscar por foto", "🔍 Buscar por foto", "🔍 Fotosuche", "🔍 Recherche photo",
+   "🔍 Cerca per foto", "🔍 Пошук за фото", "🔍 Поиск по фото")
+
 # Typed commands in every language (Quick Replies aren't shown on Instagram desktop)
 LOCAL_TEXT_COMMANDS = {
     "canción": "FIND_MUSIC", "cancion": "FIND_MUSIC", "música": "FIND_MUSIC", "musica": "FIND_MUSIC",
@@ -951,7 +964,7 @@ UNSUPPORTED_LINK_DOMAINS = (
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 FIND_KEYWORD_RE = re.compile(r"\bfind\b", re.IGNORECASE)
 
-BUILD = "2026-11-28 prints-grammar"  # shown in the startup log to confirm which code is deployed
+BUILD = "2026-11-28 photo-search"  # shown in the startup log to confirm which code is deployed
 IG_TEXT_LIMIT = 950  # Instagram text messages must be < 1000 characters
 
 
@@ -2332,6 +2345,29 @@ async def extract_frames(info: MediaInfo, workdir: Path, width: int = 640) -> li
     return frames
 
 
+async def crop_item(frame: bytes, box: list, workdir: Path) -> bytes | None:
+    """Cuts one item out of a frame (box = [ymin, xmin, ymax, xmax] on 0-1000) with a little margin."""
+    try:
+        y1, x1, y2, x2 = (max(0, min(1000, int(v))) for v in box[:4])
+    except (TypeError, ValueError):
+        return None
+    if y2 - y1 < 40 or x2 - x1 < 40:
+        return None
+    pad_y, pad_x = (y2 - y1) * 0.08, (x2 - x1) * 0.08
+    y1, x1 = max(0, y1 - pad_y), max(0, x1 - pad_x)
+    y2, x2 = min(1000, y2 + pad_y), min(1000, x2 + pad_x)
+    src, out = workdir / f"crop_src_{uuid.uuid4().hex[:6]}.jpg", workdir / f"crop_{uuid.uuid4().hex[:6]}.jpg"
+    src.write_bytes(frame)
+    vf = (f"crop=w=iw*{(x2 - x1) / 1000:.4f}:h=ih*{(y2 - y1) / 1000:.4f}:"
+          f"x=iw*{x1 / 1000:.4f}:y=ih*{y1 / 1000:.4f}")
+    rc, _, err = await run_cmd(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
+                                "-vf", vf, "-q:v", "3", str(out)], timeout=10)
+    if rc != 0 or not out.exists():
+        log.debug("crop failed: %r", err[:200])
+        return None
+    return out.read_bytes()
+
+
 # =============================================================================
 # Stripe (hosted Checkout + Customer Portal; no SDK needed)
 # =============================================================================
@@ -2605,8 +2641,12 @@ ITEMS_SCHEMA: dict[str, Any] = {
                     "description": {"type": "string"},
                     "search_query": {"type": "string"},
                     "confidence": {"type": "number"},
+                    "frame": {"type": "integer", "description": "0-based index of the image where it's best visible"},
+                    "box_2d": {"type": "array", "items": {"type": "integer"},
+                               "description": "[ymin, xmin, ymax, xmax] of the item in that image, 0-1000 scale"},
                 },
-                "required": ["name", "category", "brand", "print", "description", "search_query", "confidence"],
+                "required": ["name", "category", "brand", "print", "description", "search_query", "confidence",
+                             "frame", "box_2d"],
             },
         },
     },
@@ -2655,7 +2695,8 @@ _ITEMS_RULES = (
     "`name`: how a person would call the item in 2-6 words — colour + item, plus brand/model if known and the "
     "print if there is one (e.g. 'Black T-shirt with a “Nirvana” print', 'Nike Dunk Low sneakers'). "
     "It must be grammatically correct in the output language: adjectives agree in gender and number with the "
-    "noun, natural word order. confidence is 0..1. found=false if nothing identifiable is visible. "
+    "noun, natural word order. `frame` + `box_2d`: the image where the item is clearest and a tight box around "
+    "the item there (it is cropped for a visual 'search by photo'). confidence is 0..1. found=false if nothing identifiable is visible. "
     "Prioritise distinctive things (gear, gadgets, instruments, sneakers, bags, watches, statement pieces) over "
     "generic basics like plain black pants. For instruments, synthesizers, electronics, cameras, cars, watches "
     "and sneakers try hard to name the exact make and model: read logos and model names printed on the device, "
@@ -3179,16 +3220,25 @@ def place_card(data: dict) -> dict:
     ])
 
 
-def item_cards(items: list[dict]) -> list[dict]:
+def shopping_url(item: dict) -> str:
+    return f"https://www.google.com/search?tbm=shop&q={quote_plus(_s(item.get('search_query')))}"
+
+
+def item_cards(items: list[dict], photos: list[str] | None = None) -> list[dict]:
+    """photos[i] = public URL of the item's crop → card picture + 'Search by photo' (Google Lens finds
+    the exact piece, prints included, far better than any text query)."""
     amazon = {"es": "amazon.es", "pt": "amazon.com.br", "de": "amazon.de", "fr": "amazon.fr",
               "it": "amazon.it"}.get(CURRENT_LANG.get(), "amazon.com")
     cards = []
     for i, (it, name) in enumerate(zip(items, item_names(items), strict=True), 1):
         q = _s(it.get("search_query"))
-        cards.append(make_card(f"{i}. {name}", f"🔎 {q}", [
-            url_button("🛍 Google Shopping", f"https://www.google.com/search?tbm=shop&q={quote_plus(q)}"),
-            url_button("📦 Amazon", f"https://www.{amazon}/s?k={quote_plus(q)}"),
-        ]))
+        photo = (photos or [""] * len(items))[i - 1]
+        buttons = [url_button("🛍 Google Shopping", shopping_url(it)),
+                   url_button("📦 Amazon", f"https://www.{amazon}/s?k={quote_plus(q)}")]
+        if photo:
+            buttons.insert(0, url_button(_t("🔍 Search by photo"),
+                                         f"https://lens.google.com/uploadbyurl?url={quote_plus(photo)}"))
+        cards.append(make_card(f"{i}. {name}", f"🔎 {q}", buttons, photo))
     return cards
 
 
@@ -3249,6 +3299,7 @@ class Bot:
                                             if settings.stripe_secret_key and settings.stripe_prices else None)
         self.langs: TTLCache = TTLCache(maxsize=20_000, ttl=3600)
         self.mention_times: deque[float] = deque()
+        self.photos: TTLCache = TTLCache(maxsize=600, ttl=24 * 3600)  # item crops for "Search by photo"
         self.mention_cache: TTLCache = TTLCache(maxsize=2000, ttl=6 * 3600)
         self.redeem_fails: dict[str, int] = {}
         self.reels = ReelExtractor(settings.ig_cookies, settings.download_proxy, settings.tmp_root)
@@ -3987,9 +4038,11 @@ class Bot:
                 blocks.append(footer)
                 cards = [c for b in outcome.branches.values() for c in b.cards][:10]
                 more = followup_replies(action)
+                if self.s.referral_credits <= 0:
+                    more = [q for q in more if q["payload"] != INVITE]
+                prompt = "📚 Saved to My lists" if action == FIND_ALL else "Find something else? 👇"
                 if not cards:
-                    if more:
-                        blocks.append(_t("Find something else? 👇"))
+                    blocks.append(_t(prompt))
                     await self.safe_send(igsid, "\n\n".join(blocks), more)
                 else:
                     await self.safe_send(igsid, "\n\n".join(blocks))
@@ -3998,8 +4051,7 @@ class Bot:
                     except GraphAPIError as exc:
                         log.warning("Link buttons failed (%s) → sending links as text", exc)
                         await self.safe_send(igsid, cards_as_text(cards))
-                    if more:
-                        await self.safe_send(igsid, "Find something else? 👇", more)
+                    await self.safe_send(igsid, prompt, more)
                 if new_balance == 0:  # just used the last free search → offer the invite bonus
                     await self.safe_send(igsid, "🔋 That was your last free search.")
                     await self.send_invite(igsid)
@@ -4332,6 +4384,26 @@ class Bot:
                             finds=[("song", name, _s(result.get("album")), card["buttons"][0]["url"])],
                             summary=f"🎵 {name}")
 
+    async def item_photos(self, items: list[dict], frames: list[bytes], workdir: Path) -> list[str]:
+        """Crops each item and serves it for 24 h at an unguessable URL (for Google Lens)."""
+        if not self.s.public_url:
+            return [""] * len(items)
+
+        async def one(it: dict) -> str:
+            try:
+                idx = int(it.get("frame") or 0)
+            except (TypeError, ValueError):
+                idx = 0
+            frame = frames[idx] if 0 <= idx < len(frames) else frames[0]
+            crop = await crop_item(frame, it.get("box_2d") or [], workdir)
+            if not crop:
+                return ""
+            token = secrets.token_urlsafe(12)
+            self.photos[token] = crop
+            return f"{self.s.public_url}/img/{token}.jpg"
+
+        return list(await asyncio.gather(*(one(it) for it in items)))
+
     async def _vision_branch(self, action: str, info: MediaInfo, workdir: Path, strict: bool,
                              hint: ResolvedPost | None = None) -> BranchResult:
         context = ""
@@ -4397,12 +4469,13 @@ class Bot:
             res.finds.append(("movie", head, _s(movie.get("kind")), card["buttons"][1]["url"]))
             summaries.append(f"🎬 {head}")
         if items:
-            cards = item_cards(items)
+            photos = await self.item_photos(items, frames, workdir)
+            cards = item_cards(items, photos)
             texts.append(format_items(items))
             res.cards += cards
             for card, it in zip(cards, items, strict=True):
                 name = card["title"].split(". ", 1)[-1]
-                res.finds.append(("item", name, _s(it.get("search_query")), card["buttons"][0]["url"]))
+                res.finds.append(("item", name, _s(it.get("search_query")), shopping_url(it)))
             summaries.append("👕 " + "; ".join(c["title"].split(". ", 1)[-1] for c in cards[:3]))
         if place_is_found(place):
             card = place_card(place)
@@ -4566,7 +4639,8 @@ reply to your messages and comments, and keep the service secure.</p>
 <ul>
   <li>Your ID, balance and dates are kept while you use the service or until you ask us to delete them.</li>
   <li>Payment records may be kept longer where accounting or tax law requires it.</li>
-  <li>Media files are not stored (see section 2).</li>
+  <li>Media files are not stored (see section 2). Small cut-outs of items we found are kept up to 24 hours at an
+      unguessable link, so the "Search by photo" button can work.</li>
 </ul>
 
 <h2 id="delete">6. How to delete your data</h2>
@@ -4825,6 +4899,16 @@ async def pay(token: str, plan: str) -> Response:
         return _page(user["lang"] or "en", "😕", "Payments are temporarily unavailable. Please try again in a "
                                                  "few minutes.", bot.bot_link(), status=503)
     return RedirectResponse(url, status_code=303, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/img/{name}")
+async def item_photo(name: str) -> Response:
+    assert bot is not None
+    data = bot.photos.get(name.removesuffix(".jpg"))
+    if not data:
+        return Response(status_code=404)
+    return Response(data, media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=86400", "X-Robots-Tag": "noindex"})
 
 
 @app.get("/paid")
