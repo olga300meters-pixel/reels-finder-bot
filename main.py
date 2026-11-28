@@ -189,7 +189,9 @@ class Settings:
             max_download_mb=_env_int("MAX_DOWNLOAD_MB", 80),
             max_parallel_jobs=_env_int("MAX_PARALLEL_JOBS", 4),
             # Picks up DMs stuck in "Message requests" (Meta may not send webhooks for them). 0 = off.
-            inbox_poll_sec=_env_int("INBOX_POLL_SEC", 10),
+            # Safety net for DMs stuck in "Message requests". Each poll is one Graph API call and Meta
+            # limits calls per Instagram account (error 80002), so keep this slow. 0 = off.
+            inbox_poll_sec=_env_int("INBOX_POLL_SEC", 60),
             tmp_root=_env("TMP_ROOT", "/tmp"),
             # Only for local tests: lets the bot fetch media from localhost / private networks.
             allow_private_urls=_env("ALLOW_PRIVATE_URLS", "").lower() in ("1", "true", "yes"),
@@ -845,7 +847,7 @@ UNSUPPORTED_LINK_DOMAINS = (
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 FIND_KEYWORD_RE = re.compile(r"\bfind\b", re.IGNORECASE)
 
-BUILD = "2026-11-27 places-lists-invites"  # shown in the startup log to confirm which code is deployed
+BUILD = "2026-11-28 calm-poll"  # shown in the startup log to confirm which code is deployed
 IG_TEXT_LIMIT = 950  # Instagram text messages must be < 1000 characters
 
 
@@ -1835,6 +1837,7 @@ class ReelExtractor:
             except Exception:  # noqa: BLE001
                 log.warning("IG_COOKIES is neither a cookies.txt nor base64 of one — ignored")
                 return ""
+        text = text.lstrip("\ufeff").replace("\r\n", "\n")  # files saved on Windows
         if not text.startswith("# Netscape"):
             text = "# Netscape HTTP Cookie File\n" + text
         path = Path(tmp_root) / f"igcookies-{uuid.uuid4().hex}.txt"
@@ -1884,8 +1887,10 @@ class ReelExtractor:
                 raise MediaUnavailable(MSG_REEL_BLOCKED, "reel extractor timeout") from exc
             except Exception as exc:  # noqa: BLE001 — yt-dlp raises many types
                 reason = re.sub(r"\s+", " ", str(exc))[:300]
-                permanent = any(w in reason.lower() for w in ("private", "follow this account",
-                                                              "there is no video", "not available"))
+                # Private posts won't change; a rate-limit / login wall won't lift in a few seconds either
+                # (retrying only makes Instagram angrier) → fail fast, the user gets the screen-record tip.
+                permanent = any(w in reason.lower() for w in ("private", "follow this account", "there is no video",
+                                                              "not available", "rate-limit", "login page"))
                 if attempt == 3 or permanent:
                     raise MediaUnavailable(MSG_REEL_BLOCKED, f"reel extractor failed: {reason}") from exc
                 log.info("Reel extractor attempt %d failed (%s) → retrying", attempt, reason[:120])
@@ -3649,7 +3654,16 @@ class Bot:
             try:
                 await self.poll_inbox_once(not_before)
                 backoff = 0
-            except (GraphAPIError, httpx.HTTPError) as exc:
+            except GraphAPIError as exc:
+                if exc.code in (4, 17, 32, 613, 80002):
+                    # Meta's per-account rate limit: back off hard, so replies to users keep working
+                    backoff = min(max(backoff * 2, 600), 3600)
+                    log.warning("Inbox poll paused for %d min: Meta rate limit for this Instagram account "
+                                "(code %s). Replies are not affected by the pause.", backoff // 60, exc.code)
+                else:
+                    backoff = min(backoff * 2 or 60, 900)
+                    log.warning("Inbox poll failed (%s); next try in %ss", exc, self.s.inbox_poll_sec + backoff)
+            except httpx.HTTPError as exc:
                 backoff = min(backoff * 2 or 60, 900)
                 log.warning("Inbox poll failed (%s); next try in %ss", exc, self.s.inbox_poll_sec + backoff)
             except Exception:  # noqa: BLE001
