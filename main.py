@@ -308,7 +308,7 @@ UNSUPPORTED_LINK_DOMAINS = (
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 FIND_KEYWORD_RE = re.compile(r"\bfind\b", re.IGNORECASE)
 
-BUILD = "2026-11-22 promo"  # shown in the startup log to confirm which code is deployed
+BUILD = "2026-11-27 reels-fix"  # shown in the startup log to confirm which code is deployed
 IG_TEXT_LIMIT = 950  # Instagram text messages must be < 1000 characters
 
 
@@ -1179,15 +1179,36 @@ class ReelExtractor:
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False) or {}
 
+    @staticmethod
+    def impersonation_available() -> bool:
+        """True if curl_cffi is installed: yt-dlp can then pose as a real browser and use Instagram's
+        main (GraphQL) method. Without it only the fallback web-page method runs — often blocked."""
+        try:
+            import yt_dlp
+            from yt_dlp.networking.impersonate import ImpersonateTarget
+
+            with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+                return bool(ydl._impersonate_target_available(ImpersonateTarget()))
+        except Exception:  # noqa: BLE001
+            return False
+
     async def _resolve_uncached(self, url: str) -> ResolvedPost:
         started = asyncio.get_running_loop().time()
-        try:
-            info = await asyncio.wait_for(asyncio.to_thread(self._extract_sync, url), timeout=20)
-        except asyncio.TimeoutError as exc:
-            raise MediaUnavailable(MSG_REEL_BLOCKED, "reel extractor timeout") from exc
-        except Exception as exc:  # noqa: BLE001 — yt-dlp raises many types
-            reason = re.sub(r"\s+", " ", str(exc))[:300]
-            raise MediaUnavailable(MSG_REEL_BLOCKED, f"reel extractor failed: {reason}") from exc
+        info: dict = {}
+        for attempt in (1, 2, 3):
+            try:
+                info = await asyncio.wait_for(asyncio.to_thread(self._extract_sync, url), timeout=20)
+                break
+            except asyncio.TimeoutError as exc:
+                raise MediaUnavailable(MSG_REEL_BLOCKED, "reel extractor timeout") from exc
+            except Exception as exc:  # noqa: BLE001 — yt-dlp raises many types
+                reason = re.sub(r"\s+", " ", str(exc))[:300]
+                permanent = any(w in reason.lower() for w in ("private", "follow this account",
+                                                              "there is no video", "not available"))
+                if attempt == 3 or permanent:
+                    raise MediaUnavailable(MSG_REEL_BLOCKED, f"reel extractor failed: {reason}") from exc
+                log.info("Reel extractor attempt %d failed (%s) → retrying", attempt, reason[:120])
+                await asyncio.sleep(1.0 * attempt)
         post = pick_post_formats(info)
         log.info("Reel resolved in %.1fs: progressive=%s dash_video=%s dash_audio=%s thumb=%s "
                  "audio_label=%r (%s)",
@@ -3032,6 +3053,10 @@ async def lifespan(app: FastAPI):
     refresh_task = asyncio.create_task(bot.token_refresh_loop())
     poll_task = asyncio.create_task(bot.inbox_poll_loop())
     await vision.discover_models()
+    if ReelExtractor.impersonation_available():
+        log.info("Reel downloader: browser impersonation ON")
+    else:
+        log.warning("Reel downloader: browser impersonation OFF (curl_cffi missing) → more Reels fail")
     log.info("Bot started [build %s] (AI chain: %s)", BUILD, vision.describe)
     try:
         yield
