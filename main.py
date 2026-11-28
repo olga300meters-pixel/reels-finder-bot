@@ -30,6 +30,7 @@ import re
 import secrets
 import shutil
 import string
+import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -42,7 +43,7 @@ import asyncpg
 import httpx
 from cachetools import TTLCache
 from fastapi import BackgroundTasks, FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
@@ -138,6 +139,14 @@ class Settings:
     referral_credits: int
     referral_daily_cap: int
     mentions_enabled: bool
+    # Stripe
+    stripe_secret_key: str
+    stripe_webhook_secret: str
+    stripe_prices: dict[str, str]   # plan code → Stripe Price ID
+    pack_credits: dict[str, int]    # plan code → credits (one-time packs)
+    stripe_automatic_tax: bool
+    public_url: str
+    sub_daily_limit: int
     mentions_per_hour: int
     ig_cookies: str
     download_proxy: str
@@ -208,6 +217,19 @@ class Settings:
             # Answer @mentions in comments under other people's Reels (free, rate-limited).
             mentions_enabled=_env("MENTIONS_ENABLED", "1").lower() not in ("0", "false", "no"),
             mentions_per_hour=_env_int("MENTIONS_PER_HOUR", 20),
+            # Stripe: secret (or restricted) key + webhook signing secret + Price IDs from the dashboard.
+            stripe_secret_key=_env("STRIPE_SECRET_KEY", ""),
+            stripe_webhook_secret=_env("STRIPE_WEBHOOK_SECRET", ""),
+            stripe_prices={code: price for code, price in (
+                ("s", _env("STRIPE_PRICE_PACK_S", "")), ("l", _env("STRIPE_PRICE_PACK_L", "")),
+                ("m", _env("STRIPE_PRICE_MONTHLY", "")), ("y", _env("STRIPE_PRICE_YEARLY", ""))) if price},
+            pack_credits={"s": _env_int("PACK_S_CREDITS", 50), "l": _env_int("PACK_L_CREDITS", 150)},
+            stripe_automatic_tax=_env("STRIPE_AUTOMATIC_TAX", "0").lower() in ("1", "true", "yes"),
+            # Public https address of this server (Railway fills RAILWAY_PUBLIC_DOMAIN by itself).
+            public_url=(_env("PUBLIC_URL", "") or (f"https://{_env('RAILWAY_PUBLIC_DOMAIN', '')}"
+                                                    if _env("RAILWAY_PUBLIC_DOMAIN", "") else "")).rstrip("/"),
+            # Fair use for Unlimited: max searches per day (protects against bots / resellers).
+            sub_daily_limit=_env_int("SUB_DAILY_LIMIT", 100),
             ig_cookies=_env("IG_COOKIES", ""),
             download_proxy=_env("DOWNLOAD_PROXY", ""),
             shazam_enabled=_env("SHAZAM_ENABLED", "1").lower() not in ("0", "false", "no"),
@@ -230,6 +252,13 @@ ACTION_COST = {FIND_MUSIC: 1, FIND_MOVIE: 1, FIND_ITEM: 1, FIND_PLACE: 1, FIND_A
 MY_LISTS = "MY_LISTS"
 INVITE = "INVITE"
 LIST_KINDS = ("song", "movie", "item", "place")
+
+
+def followup_replies(done: str) -> list[dict] | None:
+    """Buttons after a search: the other single searches + My lists. None after 'Find everything'."""
+    if done == FIND_ALL:
+        return None
+    return [q for q in QUICK_REPLIES if q["payload"] not in (done, FIND_ALL)]
 
 # =============================================================================
 # Languages: the user picks one with flag buttons on first contact (or sends "language").
@@ -511,6 +540,73 @@ _L("👕 Items: nothing identifiable", "👕 Objetos: nada identificable", "👕
 _L("📍 Place: not recognised", "📍 Lugar: no reconocido", "📍 Lugar: não reconhecido", "📍 Ort: nicht erkannt",
    "📍 Lieu : non reconnu", "📍 Luogo: non riconosciuto", "📍 Місце: не впізнано", "📍 Место: не распознано")
 
+_L("💳 Choose a plan 👇 You'll pay on a secure Stripe page — the purchase is linked to your Instagram account automatically.",
+   "💳 Elige un plan 👇 Pagarás en una página segura de Stripe y la compra se vincula a tu cuenta de Instagram automáticamente.",
+   "💳 Escolha um plano 👇 Você paga numa página segura do Stripe — a compra é vinculada à sua conta do Instagram automaticamente.",
+   "💳 Wähle einen Plan 👇 Du zahlst auf einer sicheren Stripe-Seite – der Kauf wird automatisch mit deinem Instagram-Konto verknüpft.",
+   "💳 Choisis une offre 👇 Tu paies sur une page Stripe sécurisée — l'achat est lié automatiquement à ton compte Instagram.",
+   "💳 Scegli un piano 👇 Paghi su una pagina sicura di Stripe e l'acquisto viene collegato automaticamente al tuo account Instagram.",
+   "💳 Обери тариф 👇 Оплата на захищеній сторінці Stripe — покупка автоматично прив'язується до твого акаунта Instagram.",
+   "💳 Выбери тариф 👇 Оплата на защищённой странице Stripe — покупка автоматически привяжется к твоему аккаунту Instagram.")
+_L("🔋 You're out of credits.", "🔋 Te quedaste sin créditos.", "🔋 Seus créditos acabaram.", "🔋 Deine Credits sind aufgebraucht.",
+   "🔋 Tu n'as plus de crédits.", "🔋 Hai finito i crediti.", "🔋 Кредити закінчилися.", "🔋 Кредиты закончились.")
+_L("⚡ {n} searches", "⚡ {n} búsquedas", "⚡ {n} buscas", "⚡ {n} Suchen", "⚡ {n} recherches", "⚡ {n} ricerche",
+   "⚡ {n} пошуків", "⚡ {n} поисков")
+_L("One-time purchase • credits never expire", "Pago único • los créditos no caducan", "Pagamento único • créditos não expiram",
+   "Einmalzahlung • Credits verfallen nicht", "Achat unique • les crédits n'expirent pas", "Acquisto singolo • i crediti non scadono",
+   "Разова покупка • кредити не згорають", "Разовая покупка • кредиты не сгорают")
+_L("♾ Unlimited · 1 month", "♾ Ilimitado · 1 mes", "♾ Ilimitado · 1 mês", "♾ Unlimited · 1 Monat", "♾ Illimité · 1 mois",
+   "♾ Illimitato · 1 mese", "♾ Безліміт · 1 місяць", "♾ Безлимит · 1 месяц")
+_L("♾ Unlimited · 1 year", "♾ Ilimitado · 1 año", "♾ Ilimitado · 1 ano", "♾ Unlimited · 1 Jahr", "♾ Illimité · 1 an",
+   "♾ Illimitato · 1 anno", "♾ Безліміт · 1 рік", "♾ Безлимит · 1 год")
+_L("Search as much as you like • cancel anytime", "Busca todo lo que quieras • cancela cuando quieras",
+   "Busque à vontade • cancele quando quiser", "So viel suchen, wie du willst • jederzeit kündbar",
+   "Cherche autant que tu veux • résiliable à tout moment", "Cerca quanto vuoi • disdici quando vuoi",
+   "Шукай скільки завгодно • скасування будь-коли", "Ищи сколько угодно • отмена в любой момент")
+_L("Best value • cancel anytime", "La mejor opción • cancela cuando quieras", "Melhor custo-benefício • cancele quando quiser",
+   "Am günstigsten • jederzeit kündbar", "Le meilleur prix • résiliable à tout moment", "Il più conveniente • disdici quando vuoi",
+   "Найвигідніше • скасування будь-коли", "Выгоднее всего • отмена в любой момент")
+_L("Buy · {price}", "Comprar · {price}", "Comprar · {price}", "Kaufen · {price}", "Acheter · {price}", "Acquista · {price}",
+   "Купити · {price}", "Купить · {price}")
+_L("Subscribe · {price}", "Suscribirse · {price}", "Assinar · {price}", "Abonnieren · {price}", "S'abonner · {price}",
+   "Abbonati · {price}", "Підписатися · {price}", "Подписаться · {price}")
+_L("⭐ Your Unlimited plan", "⭐ Tu plan Ilimitado", "⭐ Seu plano Ilimitado", "⭐ Dein Unlimited-Abo", "⭐ Ton offre Illimitée",
+   "⭐ Il tuo piano Illimitato", "⭐ Твій Безліміт", "⭐ Твой Безлимит")
+_L("Active until {date} • change or cancel", "Activo hasta {date} • cambiar o cancelar", "Ativo até {date} • alterar ou cancelar",
+   "Aktiv bis {date} • ändern oder kündigen", "Actif jusqu'au {date} • modifier ou résilier", "Attivo fino al {date} • modifica o disdici",
+   "Активний до {date} • змінити або скасувати", "Активен до {date} • изменить или отменить")
+_L("⚙️ Manage", "⚙️ Gestionar", "⚙️ Gerenciar", "⚙️ Verwalten", "⚙️ Gérer", "⚙️ Gestisci", "⚙️ Керувати", "⚙️ Управлять")
+_L("You've reached today's fair-use limit for Unlimited ({n} searches) — it resets tomorrow 🙂",
+   "Llegaste al límite de uso justo de hoy del plan Ilimitado ({n} búsquedas): se reinicia mañana 🙂",
+   "Você atingiu o limite de uso justo de hoje do Ilimitado ({n} buscas) — ele reinicia amanhã 🙂",
+   "Du hast das heutige Fair-Use-Limit von Unlimited erreicht ({n} Suchen) – morgen geht's weiter 🙂",
+   "Tu as atteint la limite d'utilisation équitable du jour pour l'offre Illimitée ({n} recherches) — elle se réinitialise demain 🙂",
+   "Hai raggiunto il limite giornaliero di uso corretto dell'Illimitato ({n} ricerche): si azzera domani 🙂",
+   "Ти досяг денного ліміту чесного використання Безліміту ({n} пошуків) — завтра він оновиться 🙂",
+   "Ты достиг дневного лимита честного использования Безлимита ({n} поисков) — завтра он обновится 🙂")
+_L("✅ Payment received!", "✅ ¡Pago recibido!", "✅ Pagamento recebido!", "✅ Zahlung erhalten!", "✅ Paiement reçu !",
+   "✅ Pagamento ricevuto!", "✅ Оплату отримано!", "✅ Оплата получена!")
+_L("Go back to Instagram — your purchase is already active.", "Vuelve a Instagram: tu compra ya está activa.",
+   "Volte para o Instagram — sua compra já está ativa.", "Geh zurück zu Instagram – dein Kauf ist schon aktiv.",
+   "Retourne sur Instagram — ton achat est déjà actif.", "Torna su Instagram: il tuo acquisto è già attivo.",
+   "Повертайся в Instagram — покупка вже активна.", "Возвращайся в Instagram — покупка уже активна.")
+_L("Payment cancelled — nothing was charged.", "Pago cancelado: no se cobró nada.", "Pagamento cancelado — nada foi cobrado.",
+   "Zahlung abgebrochen – es wurde nichts berechnet.", "Paiement annulé — rien n'a été débité.", "Pagamento annullato: nessun addebito.",
+   "Оплату скасовано — нічого не списано.", "Оплата отменена — ничего не списано.")
+_L("Back to Instagram", "Volver a Instagram", "Voltar ao Instagram", "Zurück zu Instagram", "Retour sur Instagram",
+   "Torna su Instagram", "Назад в Instagram", "Назад в Instagram")
+_L("This payment link is invalid. Open a fresh one from the bot.", "Este enlace de pago no es válido. Abre uno nuevo desde el bot.",
+   "Este link de pagamento é inválido. Abra um novo pelo bot.", "Dieser Zahlungslink ist ungültig. Öffne einen neuen im Bot.",
+   "Ce lien de paiement n'est pas valide. Ouvre-en un nouveau depuis le bot.", "Questo link di pagamento non è valido. Aprine uno nuovo dal bot.",
+   "Це посилання для оплати недійсне. Відкрий нове в боті.", "Эта ссылка на оплату недействительна. Открой новую в боте.")
+_L("Payments are temporarily unavailable. Please try again in a few minutes.",
+   "Los pagos no están disponibles por ahora. Inténtalo de nuevo en unos minutos.",
+   "Pagamentos indisponíveis no momento. Tente de novo em alguns minutos.",
+   "Zahlungen sind gerade nicht verfügbar. Bitte versuch es in ein paar Minuten nochmal.",
+   "Les paiements sont momentanément indisponibles. Réessaie dans quelques minutes.",
+   "I pagamenti non sono disponibili al momento. Riprova tra qualche minuto.",
+   "Оплата тимчасово недоступна. Спробуй за кілька хвилин.", "Оплата временно недоступна. Попробуй через несколько минут.")
+
 # Typed commands in every language (Quick Replies aren't shown on Instagram desktop)
 LOCAL_TEXT_COMMANDS = {
     "canción": "FIND_MUSIC", "cancion": "FIND_MUSIC", "música": "FIND_MUSIC", "musica": "FIND_MUSIC",
@@ -588,7 +684,10 @@ LIST_COMMANDS = {"list", "lists", "my list", "my lists", "collection", "my finds
 INVITE_COMMANDS = {"invite", "invite friends", "referral", "friends", "refer", "invitar", "convidar",
                    "einladen", "inviter", "invita", "invitare", "пригласить", "запросити", "друзья", "друзі"}
 BALANCE_COMMANDS = {"balance", "credits", "status", "my credits"}
-BUY_COMMANDS = {"buy", "upgrade", "pricing", "premium", "subscribe", "pay"}
+BUY_COMMANDS = {"buy", "upgrade", "pricing", "premium", "subscribe", "pay", "plans", "comprar", "precios",
+                "kaufen", "acheter", "acquista", "купить", "купити", "тарифы", "тарифи", "оплата"}
+MANAGE_COMMANDS = {"manage", "subscription", "my subscription", "cancel", "cancel subscription", "unsubscribe",
+                   "подписка", "отменить подписку", "підписка", "suscripción", "assinatura", "abo", "abonnement"}
 TEXT_COMMANDS.update(LOCAL_TEXT_COMMANDS)
 BALANCE_COMMANDS |= LOCAL_BALANCE_COMMANDS
 PROMO_RE = re.compile(r"[A-Z0-9][A-Z0-9_-]{2,23}")
@@ -599,7 +698,7 @@ MSG_DATA_DELETED = (
 )
 
 MSG_OVERLOAD = "Temporary overload, your credit was not deducted. Please try again in a moment."
-MSG_MENU = "Got it! 🔥 What should I find in this one?\n(On desktop? Just reply: song, movie, outfit or all)"
+MSG_MENU = "What should I find? 👇"
 MSG_NO_MEDIA = "Send me a Reel, video or photo first 🙂\nTap ✈️ under any Reel → send it to me."
 MSG_LINK_UNSUPPORTED = (
     "I can't open TikTok / YouTube links yet 🙈\n"
@@ -641,14 +740,10 @@ MSG_PAYMENT_SUB = "✅ Unlimited is active until {date}! 🔥\nSend me any Reel 
 
 
 # ---- translations of the messages above (order: es, pt, de, fr, it, uk, ru)
-_L(MSG_MENU,
-   "¡Listo! 🔥 ¿Qué busco en este?\n(¿En el ordenador? Responde: canción, película, ropa o todo)",
-   "Beleza! 🔥 O que eu procuro neste?\n(No computador? Responda: música, filme, roupa ou tudo)",
-   "Hab's! 🔥 Was soll ich hier finden?\n(Am Computer? Antworte einfach: song, film, kleidung oder alles)",
-   "Reçu ! 🔥 Qu'est-ce que je cherche dans celui-ci ?\n(Sur ordinateur ? Réponds : chanson, film, tenue ou tout)",
-   "Ricevuto! 🔥 Cosa cerco in questo?\n(Da computer? Rispondi: canzone, film, vestiti o tutto)",
-   "Є! 🔥 Що шукаємо в цьому?\n(З комп'ютера? Просто напиши: пісня, фільм, одяг або все)",
-   "Есть! 🔥 Что ищем в этом?\n(С компьютера? Просто напиши: песня, фильм, одежда или всё)")
+_L(MSG_MENU, "¿Qué busco? 👇", "O que eu procuro? 👇", "Was soll ich finden? 👇", "Qu'est-ce que je cherche ? 👇",
+   "Cosa cerco? 👇", "Що шукаємо? 👇", "Что ищем? 👇")
+_L("Find something else? 👇", "¿Busco algo más? 👇", "Procuro mais alguma coisa? 👇", "Noch etwas finden? 👇",
+   "Je cherche autre chose ? 👇", "Cerco altro? 👇", "Шукаємо ще щось? 👇", "Ищем что-то ещё? 👇")
 _L(MSG_NO_MEDIA,
    "Primero mándame un Reel, video o foto 🙂\nToca ✈️ debajo de cualquier Reel → envíamelo.",
    "Primeiro me mande um Reel, vídeo ou foto 🙂\nToque em ✈️ embaixo de qualquer Reel → envie pra mim.",
@@ -856,7 +951,7 @@ UNSUPPORTED_LINK_DOMAINS = (
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 FIND_KEYWORD_RE = re.compile(r"\bfind\b", re.IGNORECASE)
 
-BUILD = "2026-11-28 sharper-search-2"  # shown in the startup log to confirm which code is deployed
+BUILD = "2026-11-28 polish"  # shown in the startup log to confirm which code is deployed
 IG_TEXT_LIMIT = 950  # Instagram text messages must be < 1000 characters
 
 
@@ -954,6 +1049,11 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS last_media_mid  TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS lang            TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_code        TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS users_ref_code_idx ON users (ref_code);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS pay_token       TEXT;      -- secret part of the user's payment links
+CREATE UNIQUE INDEX IF NOT EXISTS users_pay_token_idx ON users (pay_token);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS quota_day       DATE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS quota_used      INT NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS finds (            -- "My lists": what the bot found for each user
     id          BIGSERIAL PRIMARY KEY,
@@ -1320,6 +1420,78 @@ class Database:
                 """,
                 igsid, self._free_credits, credits,
             )
+
+    # ---- Stripe
+    async def pay_token(self, igsid: str) -> str:
+        assert self.pool
+        await self.get_or_create_user(igsid)
+        token = await self.pool.fetchval("SELECT pay_token FROM users WHERE igsid = $1", igsid)
+        while not token:
+            try:
+                token = await self.pool.fetchval(
+                    "UPDATE users SET pay_token = $2 WHERE igsid = $1 AND pay_token IS NULL RETURNING pay_token",
+                    igsid, secrets.token_urlsafe(18)) or await self.pool.fetchval(
+                    "SELECT pay_token FROM users WHERE igsid = $1", igsid)
+            except asyncpg.UniqueViolationError:
+                continue
+        return token
+
+    async def user_by_pay_token(self, token: str) -> asyncpg.Record | None:
+        assert self.pool
+        if not token or len(token) > 64:
+            return None
+        return await self.pool.fetchrow("SELECT * FROM users WHERE pay_token = $1", token)
+
+    async def set_stripe_customer(self, igsid: str, customer: str) -> None:
+        assert self.pool
+        await self.pool.execute("UPDATE users SET stripe_customer = $2 WHERE igsid = $1 AND $2 <> ''",
+                                igsid, customer)
+
+    async def set_subscription_until(self, event_key: str, igsid: str, event_name: str,
+                                     until: datetime) -> datetime | None:
+        """sub_until = max(current, until). None if this event was already processed."""
+        assert self.pool
+        async with self.pool.acquire() as conn, conn.transaction():
+            claimed = await conn.fetchval(
+                "INSERT INTO payment_events (event_key, igsid, event_name) VALUES ($1, $2, $3) "
+                "ON CONFLICT (event_key) DO NOTHING RETURNING event_key", event_key, igsid, event_name)
+            if not claimed:
+                return None
+            return await conn.fetchval(
+                """INSERT INTO users (igsid, credits, sub_until) VALUES ($1, $2::int, $3)
+                   ON CONFLICT (igsid) DO UPDATE
+                   SET sub_until = GREATEST(COALESCE(users.sub_until, $3), $3), updated_at = now()
+                   RETURNING sub_until""", igsid, self._free_credits, until)
+
+    async def end_subscription(self, igsid: str, ended_at: datetime) -> None:
+        assert self.pool
+        await self.pool.execute("UPDATE users SET sub_until = LEAST(sub_until, $2), updated_at = now() "
+                                "WHERE igsid = $1 AND sub_until IS NOT NULL", igsid, ended_at)
+
+    async def remove_credits(self, event_key: str, igsid: str, event_name: str, credits: int) -> int | None:
+        assert self.pool
+        async with self.pool.acquire() as conn, conn.transaction():
+            claimed = await conn.fetchval(
+                "INSERT INTO payment_events (event_key, igsid, event_name) VALUES ($1, $2, $3) "
+                "ON CONFLICT (event_key) DO NOTHING RETURNING event_key", event_key, igsid, event_name)
+            if not claimed:
+                return None
+            return await conn.fetchval(
+                "UPDATE users SET credits = GREATEST(credits - $2::int, 0), updated_at = now() "
+                "WHERE igsid = $1 RETURNING credits", igsid, credits)
+
+    async def sub_quota_used(self, igsid: str) -> int:
+        assert self.pool
+        return await self.pool.fetchval(
+            "SELECT CASE WHEN quota_day = CURRENT_DATE THEN quota_used ELSE 0 END FROM users WHERE igsid = $1",
+            igsid) or 0
+
+    async def add_sub_quota(self, igsid: str, n: int) -> None:
+        assert self.pool
+        await self.pool.execute(
+            """UPDATE users SET quota_used = CASE WHEN quota_day = CURRENT_DATE THEN quota_used + $2::int
+                                                  ELSE $2::int END,
+                                quota_day = CURRENT_DATE WHERE igsid = $1""", igsid, n)
 
     async def apply_subscription(self, event_key: str, igsid: str, event_name: str, days: int) -> datetime | None:
         """Extends sub_until by N days from max(now, current sub_until). None if duplicate."""
@@ -2098,12 +2270,19 @@ async def extract_audio_clip(info: MediaInfo, workdir: Path) -> bytes:
     return out.read_bytes()
 
 
-async def extract_wav_clip(info: MediaInfo, workdir: Path, rate: float = 1.0, seconds: int = 12) -> bytes:
+async def extract_wav_clip(info: MediaInfo, workdir: Path, rate: float = 1.0, seconds: int = 12,
+                           start: float | None = None, clean: bool = False) -> bytes:
     """12 s mono 16 kHz WAV for Shazam. rate != 1 plays it faster/slower WITH pitch change:
     that undoes "sped up" / "slowed" edits, so the original track can be matched."""
-    start = 1.0 if info.duration >= 14.0 else 0.0
+    if start is None:
+        start = 1.0 if info.duration >= 14.0 else 0.0
     out = workdir / f"shz_{rate:.2f}_{uuid.uuid4().hex[:6]}.wav"
-    af = ["-af", f"aresample=44100,asetrate={44100 * rate:.0f},aresample=16000"] if rate != 1.0 else []
+    filters = []
+    if rate != 1.0:
+        filters.append(f"aresample=44100,asetrate={44100 * rate:.0f},aresample=16000")
+    if clean:  # phone-recorded / noisy covers: cut rumble & hiss, even out loudness
+        filters.append("highpass=f=90,lowpass=f=7500,dynaudnorm=f=150:g=15")
+    af = ["-af", ",".join(filters)] if filters else []
     rc, _, err = await run_cmd(
         ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
          "-ss", f"{start:.2f}", "-i", str(info.path), "-vn", *af,
@@ -2151,6 +2330,84 @@ async def extract_frames(info: MediaInfo, workdir: Path, width: int = 640) -> li
     if not frames:
         raise MediaUnavailable(MSG_UNSUPPORTED, "no frames extracted")
     return frames
+
+
+# =============================================================================
+# Stripe (hosted Checkout + Customer Portal; no SDK needed)
+# =============================================================================
+
+CURRENCY_SIGNS = {"usd": "$", "eur": "€", "gbp": "£", "cad": "CA$", "aud": "A$", "brl": "R$"}
+
+
+class StripeError(Exception):
+    pass
+
+
+class StripeClient:
+    API = "https://api.stripe.com/v1"
+
+    def __init__(self, http: httpx.AsyncClient, key: str):
+        self._http = http
+        self._key = key
+        self.price_labels: dict[str, str] = {}  # Price ID → "$4.99"
+
+    async def _call(self, method: str, path: str, form: list[tuple[str, str]] | None = None) -> dict:
+        try:
+            resp = await self._http.request(
+                method, f"{self.API}/{path}", content=urlencode(form or []).encode() if form else None,
+                headers={"Authorization": f"Bearer {self._key}", "Stripe-Version": "2024-06-20",
+                         "Content-Type": "application/x-www-form-urlencoded"},
+                timeout=httpx.Timeout(15.0, connect=5.0))
+            data = resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise StripeError(f"Stripe {path}: {exc}") from exc
+        if resp.status_code >= 400:
+            raise StripeError(f"Stripe {path}: HTTP {resp.status_code} "
+                              f"{_s((data.get('error') or {}).get('message'))[:200]}")
+        return data
+
+    async def load_prices(self, price_ids: list[str]) -> None:
+        for pid in price_ids:
+            try:
+                p = await self._call("GET", f"prices/{pid}")
+            except StripeError as exc:
+                log.error("Stripe price %s: %s", pid, exc)
+                continue
+            amount, cur = (p.get("unit_amount") or 0) / 100, _s(p.get("currency")).lower()
+            sign = CURRENCY_SIGNS.get(cur)
+            num = f"{amount:.2f}".rstrip("0").rstrip(".") if amount == int(amount) else f"{amount:.2f}"
+            self.price_labels[pid] = f"{sign}{num}" if sign else f"{num} {cur.upper()}"
+
+    async def create_checkout(self, form: list[tuple[str, str]]) -> str:
+        return _s((await self._call("POST", "checkout/sessions", form)).get("url"))
+
+    async def portal(self, customer: str, return_url: str) -> str:
+        return _s((await self._call("POST", "billing_portal/sessions",
+                                    [("customer", customer), ("return_url", return_url)])).get("url"))
+
+    async def subscription(self, sub_id: str) -> dict:
+        return await self._call("GET", f"subscriptions/{sub_id}")
+
+
+def subscription_period_end(sub: dict) -> datetime | None:
+    """Works with old (top-level) and new (per-item) Stripe API shapes."""
+    end = sub.get("current_period_end") or next(
+        (it.get("current_period_end") for it in ((sub.get("items") or {}).get("data") or [])
+         if it.get("current_period_end")), None)
+    return datetime.fromtimestamp(int(end), timezone.utc) if end else None
+
+
+def verify_stripe_signature(raw: bytes, header: str, secret: str, tolerance: int = 300) -> bool:
+    try:
+        parts = dict(kv.split("=", 1) for kv in header.split(",") if "=" in kv)
+        ts = int(parts.get("t", "0"))
+    except ValueError:
+        return False
+    if not ts or abs(time.time() - ts) > tolerance:
+        return False
+    expected = hmac.new(secret.encode(), f"{ts}.".encode() + raw, hashlib.sha256).hexdigest()
+    sigs = [kv.split("=", 1)[1] for kv in header.split(",") if kv.startswith("v1=")]
+    return any(hmac.compare_digest(expected, sig) for sig in sigs)
 
 
 # =============================================================================
@@ -2385,10 +2642,11 @@ _MOVIE_RULES = (
 )
 _ITEMS_RULES = (
     "FASHION / ITEMS TASK: List up to 5 of the most prominent clothing items, shoes, accessories, bags, "
-    "eyewear, jewellery or notable products. For each: category, brand (only if a logo/design makes it "
-    "identifiable, otherwise 'Unknown'), model name if recognisable (else empty), main color, a short "
-    "description, and a precise shopping search query (brand + model + color + item type, or a descriptive "
-    "query if brand is unknown). confidence is 0..1. found=false if nothing identifiable is visible. "
+    "eyewear, jewellery or notable products. For each: category (1-2 words, e.g. 'hoodie', 'sneakers'), "
+    "brand (only if a logo/design makes it identifiable, otherwise 'Unknown'), model name if recognisable "
+    "(else empty), main color (1 word), description (max 6 words, only what tells it apart, e.g. "
+    "'cropped, with a back print'; empty if nothing notable), and a precise shopping search query "
+    "(brand + model + color + item type, or a descriptive query if brand is unknown). confidence is 0..1. found=false if nothing identifiable is visible. "
     "Prioritise distinctive things (gear, gadgets, instruments, sneakers, bags, watches, statement pieces) over "
     "generic basics like plain black pants. For instruments, synthesizers, electronics, cameras, cars, watches "
     "and sneakers try hard to name the exact make and model: read logos and model names printed on the device, "
@@ -2508,7 +2766,7 @@ class VisionClient:
         contents: list[Any] = [genai_types.Part.from_bytes(data=f, mime_type="image/jpeg") for f in frames]
         contents.append(prompt)
         try:
-            return await self._generate(contents, schema, hi_res=task in (FIND_ITEM, FIND_ALL))
+            return await self._generate(contents, schema)
         except ExternalServiceError as exc:
             if not self._backup:
                 raise
@@ -2520,7 +2778,7 @@ class VisionClient:
         contents: list[Any] = [genai_types.Part.from_bytes(data=wav, mime_type="audio/wav")]
         contents += [genai_types.Part.from_bytes(data=f, mime_type="image/jpeg") for f in frames or []]
         contents.append(song_prompt(caption, audio_label, bool(frames)))
-        return await self._generate(contents, SONG_SCHEMA)
+        return await self._generate(contents, SONG_SCHEMA, strong_first=True)
 
     async def _call_model(self, model: str, contents: list[Any], schema: dict, timeout: float,
                           hi_res: bool = False) -> dict:
@@ -2569,12 +2827,20 @@ class VisionClient:
             return data
         raise _ModelFailed(f"{model}: request rejected")
 
-    async def _generate(self, contents: list[Any], schema: dict, hi_res: bool = False) -> dict:
+    def strong_chain(self) -> list[str]:
+        """Full Flash models (best at recognising melodies) before Lite ones, newest first."""
+        def ver(m: str) -> float:
+            v = re.search(r"(\d+(?:\.\d+)?)", m)
+            return float(v.group(1)) if v else 0.0
+        return sorted(self._models, key=lambda m: ("lite" in m, "preview" in m, -ver(m)))
+
+    async def _generate(self, contents: list[Any], schema: dict, hi_res: bool = False,
+                        strong_first: bool = False) -> dict:
         """Hedged fallback chain: start the 1st model; if it is slow (> HEDGE_SEC) or fails, start the
         next one in parallel; the first good answer wins, the rest are cancelled."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.TOTAL_BUDGET_SEC
-        queue = [m for m in self._models if m not in self._dead_models]
+        queue = [m for m in (self.strong_chain() if strong_first else self._models) if m not in self._dead_models]
         errors: list[str] = []
         pending: dict[asyncio.Task, str] = {}
 
@@ -2829,17 +3095,31 @@ def filter_items(data: dict) -> list[dict]:
     return items[:5]
 
 
+def item_names(items: list[dict]) -> list[str]:
+    """Short names: 'Nike Dunk Low (sneakers)', 'Black hoodie'. A detail is added only when two
+    items would otherwise look the same."""
+    names = []
+    for it in items:
+        brand = _s(it.get("brand"))
+        brand = "" if brand.lower() in ("unknown", "n/a", "none", "-") else brand
+        model, category, color = _s(it.get("model")), _s(it.get("category")).lower(), _s(it.get("color")).lower()
+        if brand and model:
+            name = f"{brand} {model}" + (f" ({category})" if category and category not in model.lower() else "")
+        elif brand:
+            name = f"{brand} {category}".strip()
+        else:
+            name = " ".join(x for x in (color, category) if x) or _s(it.get("search_query"))
+        names.append(name[:1].upper() + name[1:])
+    base = list(names)
+    for i, n in enumerate(base):
+        if base.count(n) > 1 and _s(items[i].get("description")):
+            names[i] = f"{n} — {_s(items[i].get('description'))}"
+    return names
+
+
 def format_items(items: list[dict]) -> str:
     lines = [_t("👕 Items spotted:")]
-    for i, it in enumerate(items, 1):
-        brand = _s(it.get("brand"))
-        brand = "" if brand.lower() in ("unknown", "n/a", "none") else brand
-        name = " ".join(x for x in (brand, _s(it.get("model"))) if x) or _s(it.get("category")).capitalize()
-        details = ", ".join(x for x in (_s(it.get("color")), _s(it.get("category"))) if x)
-        lines.append(f"{i}. {name}" + (f" — {details}" if details else ""))
-        if _s(it.get("description")):
-            lines.append(f"   {_s(it.get('description'))}")
-        lines.append(f"   🔎 “{_s(it.get('search_query'))}”")
+    lines += [f"{i}. {n}" for i, n in enumerate(item_names(items), 1)]
     return "\n".join(lines)
 
 
@@ -2890,11 +3170,8 @@ def item_cards(items: list[dict]) -> list[dict]:
     amazon = {"es": "amazon.es", "pt": "amazon.com.br", "de": "amazon.de", "fr": "amazon.fr",
               "it": "amazon.it"}.get(CURRENT_LANG.get(), "amazon.com")
     cards = []
-    for i, it in enumerate(items, 1):
+    for i, (it, name) in enumerate(zip(items, item_names(items), strict=True), 1):
         q = _s(it.get("search_query"))
-        brand = _s(it.get("brand"))
-        brand = "" if brand.lower() in ("unknown", "n/a", "none") else brand
-        name = " ".join(x for x in (brand, _s(it.get("model"))) if x) or _s(it.get("category")).capitalize()
         cards.append(make_card(f"{i}. {name}", f"🔎 {q}", [
             url_button("🛍 Google Shopping", f"https://www.google.com/search?tbm=shop&q={quote_plus(q)}"),
             url_button("📦 Amazon", f"https://www.{amazon}/s?k={quote_plus(q)}"),
@@ -2955,6 +3232,8 @@ class Bot:
         self.jobs = asyncio.Semaphore(settings.max_parallel_jobs)
         self.seen_accounts: set[str] = set()
         self.admin_fails: dict[str, int] = {}
+        self.stripe: StripeClient | None = (StripeClient(http, settings.stripe_secret_key)
+                                            if settings.stripe_secret_key and settings.stripe_prices else None)
         self.langs: TTLCache = TTLCache(maxsize=20_000, ttl=3600)
         self.mention_times: deque[float] = deque()
         self.mention_cache: TTLCache = TTLCache(maxsize=2000, ttl=6 * 3600)
@@ -2998,7 +3277,172 @@ class Bot:
         sep = "&" if "?" in base else "?"
         return f"{base}{sep}{urlencode({'checkout[custom][igsid]': igsid})}"
 
+    def pay_url(self, token: str, plan: str) -> str:
+        return f"{self.s.public_url}/pay/{token}/{plan}"
+
+    async def send_plans(self, igsid: str, out_of_credits: bool = False) -> None:
+        """Plan cards with tappable 'Buy' buttons. Each link carries the user's secret pay token,
+        so whatever is bought is credited to exactly this Instagram account."""
+        assert self.stripe
+        user = await self.db.get_or_create_user(igsid)
+        token = await self.db.pay_token(igsid)
+        cards: list[dict] = []
+        if self.is_subscribed(user):
+            cards.append(make_card(_t("⭐ Your Unlimited plan"),
+                                   _t("Active until {date} • change or cancel", date=f"{user['sub_until']:%b %d, %Y}"),
+                                   [url_button(_t("⚙️ Manage"), self.pay_url(token, "manage"))]))
+        for plan in ("s", "l", "m", "y"):
+            pid = self.s.stripe_prices.get(plan)
+            if not pid or (plan in ("m", "y") and self.is_subscribed(user)):
+                continue
+            price = self.stripe.price_labels.get(pid, "")
+            if plan in ("s", "l"):
+                title, sub = _t("⚡ {n} searches", n=self.s.pack_credits[plan]), _t("One-time purchase • credits never expire")
+                btn = _t("Buy · {price}", price=price) if price else _t("Buy · {price}", price="").rstrip(" ·")
+            else:
+                title = _t("♾ Unlimited · 1 month") if plan == "m" else _t("♾ Unlimited · 1 year")
+                sub = _t("Search as much as you like • cancel anytime") if plan == "m" else _t("Best value • cancel anytime")
+                btn = _t("Subscribe · {price}", price=price) if price else _t("Subscribe · {price}", price="").rstrip(" ·")
+            cards.append(make_card(title, sub, [url_button(btn, self.pay_url(token, plan))], self.s.paywall_image_url))
+        intro = _t("💳 Choose a plan 👇 You'll pay on a secure Stripe page — the purchase is linked to your "
+                   "Instagram account automatically.")
+        if out_of_credits:
+            intro = _t("🔋 You're out of credits.") + "\n" + intro
+        await self.safe_send(igsid, intro)
+        try:
+            await self.ig.send_generic_template(igsid, cards[:10])
+        except GraphAPIError as exc:
+            log.warning("Plan cards failed (%s) → links as text", exc)
+            await self.safe_send(igsid, cards_as_text(cards))
+
+    async def send_manage(self, igsid: str) -> None:
+        user = await self.db.get_or_create_user(igsid)
+        if self.stripe and user["stripe_customer"]:
+            token = await self.db.pay_token(igsid)
+            title = _t("⭐ Your Unlimited plan") if self.is_subscribed(user) else "Stripe"
+            sub = (_t("Active until {date} • change or cancel", date=f"{user['sub_until']:%b %d, %Y}")
+                   if self.is_subscribed(user) else "")
+            await self.ig.send_generic_template(igsid, [make_card(title, sub, [
+                url_button(_t("⚙️ Manage"), self.pay_url(token, "manage"))])])
+        elif self.stripe:
+            await self.send_plans(igsid)
+        else:
+            await self.safe_send(igsid, self.balance_line(user))
+
+    async def checkout_url(self, user: asyncpg.Record, plan: str) -> str:
+        """Creates a Stripe Checkout Session for this user and plan → its URL."""
+        assert self.stripe
+        igsid, token = user["igsid"], user["pay_token"]
+        CURRENT_LANG.set(user["lang"] or "en")
+        if plan == "manage":
+            if not user["stripe_customer"]:
+                return ""
+            return await self.stripe.portal(user["stripe_customer"], f"{self.s.public_url}/paid?t={token}&ok=manage")
+        price = self.s.stripe_prices.get(plan)
+        if not price:
+            return ""
+        subscription = plan in ("m", "y")
+        if subscription and self.is_subscribed(user) and user["stripe_customer"]:
+            return await self.checkout_url(user, "manage")  # already subscribed → manage instead of a 2nd sub
+        credits = str(self.s.pack_credits.get(plan, 0))
+        form = [
+            ("mode", "subscription" if subscription else "payment"),
+            ("line_items[0][price]", price), ("line_items[0][quantity]", "1"),
+            ("success_url", f"{self.s.public_url}/paid?t={token}&ok=1"),
+            ("cancel_url", f"{self.s.public_url}/paid?t={token}&ok=0"),
+            ("client_reference_id", igsid),
+            ("metadata[igsid]", igsid), ("metadata[plan]", plan), ("metadata[credits]", credits),
+            ("allow_promotion_codes", "true"),
+            ("locale", {"pt": "pt-BR", "uk": "auto"}.get(user["lang"] or "", user["lang"] or "auto")),
+        ]
+        if user["stripe_customer"]:
+            form.append(("customer", user["stripe_customer"]))
+        elif not subscription:
+            form.append(("customer_creation", "always"))
+        if subscription:
+            form += [("subscription_data[metadata][igsid]", igsid), ("subscription_data[metadata][plan]", plan)]
+        else:
+            form += [("payment_intent_data[metadata][igsid]", igsid),
+                     ("payment_intent_data[metadata][plan]", plan),
+                     ("payment_intent_data[metadata][credits]", credits)]
+        if self.s.stripe_automatic_tax:
+            form.append(("automatic_tax[enabled]", "true"))
+        return await self.stripe.create_checkout(form)
+
+    async def handle_stripe_event(self, event: dict) -> str:
+        """Applies one Stripe webhook event. Idempotent (payment_events table). Raises → Stripe retries."""
+        assert self.stripe
+        etype, obj = _s(event.get("type")), (event.get("data") or {}).get("object") or {}
+        meta = obj.get("metadata") or {}
+
+        if etype in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
+            if _s(obj.get("payment_status")) not in ("paid", "no_payment_required"):
+                return "not paid yet"
+            igsid = _s(meta.get("igsid")) or _s(obj.get("client_reference_id"))
+            if not igsid:
+                return "no igsid"
+            if _s(obj.get("customer")):
+                await self.db.set_stripe_customer(igsid, _s(obj.get("customer")))
+            key = f"stripe:{obj.get('id')}"
+            if _s(obj.get("mode")) == "payment":
+                credits = int(_s(meta.get("credits")) or 0)
+                if credits <= 0:
+                    return "no credits in metadata"
+                balance = await self.db.apply_credit_pack(key, igsid, etype, credits)
+                if balance is None:
+                    return "duplicate"
+                log.info("Stripe: +%d credits for %s (balance %s)", credits, igsid, balance)
+                asyncio.create_task(_run_safely(self.notify_payment, igsid, MSG_PAYMENT_CREDITS,
+                                                {"n": credits, "balance": balance}))
+                return "credits added"
+            sub = await self.stripe.subscription(_s(obj.get("subscription")))
+            until = subscription_period_end(sub)
+            if not until:
+                raise StripeError(f"subscription {obj.get('subscription')} has no period end")
+            result = await self.db.set_subscription_until(key, igsid, etype, until)
+            if result is None:
+                return "duplicate"
+            log.info("Stripe: Unlimited for %s until %s", igsid, result.isoformat())
+            asyncio.create_task(_run_safely(self.notify_payment, igsid, MSG_PAYMENT_SUB,
+                                            {"date": f"{result:%b %d, %Y}"}))
+            return "subscription started"
+
+        if etype == "invoice.paid":  # renewals (and the first invoice — harmless, same period end)
+            sub_id = _s(obj.get("subscription")) or _s(
+                (((obj.get("parent") or {}).get("subscription_details")) or {}).get("subscription"))
+            if not sub_id:
+                return "not a subscription invoice"
+            sub = await self.stripe.subscription(sub_id)
+            igsid, until = _s((sub.get("metadata") or {}).get("igsid")), subscription_period_end(sub)
+            if not igsid or not until:
+                return "no igsid / period"
+            result = await self.db.set_subscription_until(f"stripe:{obj.get('id')}", igsid, etype, until)
+            if result:
+                log.info("Stripe: Unlimited for %s extended to %s", igsid, result.isoformat())
+            return "renewed" if result else "duplicate"
+
+        if etype == "customer.subscription.deleted":
+            igsid = _s(meta.get("igsid"))
+            if igsid:
+                ended = obj.get("ended_at") or obj.get("canceled_at") or time.time()
+                await self.db.end_subscription(igsid, datetime.fromtimestamp(int(ended), timezone.utc))
+                log.info("Stripe: subscription of %s ended", igsid)
+            return "subscription ended"
+
+        if etype == "charge.refunded" and obj.get("refunded"):  # full refund of a credit pack
+            igsid, credits = _s(meta.get("igsid")), int(_s(meta.get("credits")) or 0)
+            if igsid and credits:
+                left = await self.db.remove_credits(f"stripe:refund:{obj.get('id')}", igsid, etype, credits)
+                log.info("Stripe: refund → -%d credits for %s (now %s)", credits, igsid, left)
+            return "refund processed"
+
+        return "ignored"
+
     async def send_paywall(self, igsid: str, user: asyncpg.Record, cost: int) -> None:
+        if self.stripe and self.s.public_url:
+            await self.send_plans(igsid, out_of_credits=True)
+            await self.send_invite(igsid)
+            return
         if not self.s.lemon_checkout_url:
             await self.safe_send(igsid, MSG_PAYMENTS_SOON)
             await self.send_invite(igsid)
@@ -3220,7 +3664,13 @@ class Bot:
             await self.safe_send(igsid, self.balance_line(user))
             return
         if lowered in BUY_COMMANDS:
-            await self.send_paywall(igsid, user, 1)
+            if self.stripe and self.s.public_url:
+                await self.send_plans(igsid)
+            else:
+                await self.send_paywall(igsid, user, 1)
+            return
+        if lowered in MANAGE_COMMANDS:
+            await self.send_manage(igsid)
             return
         if await self.try_redeem(igsid, clean):
             return
@@ -3475,21 +3925,29 @@ class Bot:
                 if not subscribed and user["credits"] < cost:
                     await self.send_paywall(igsid, user, cost)
                     return
+                if subscribed and self.s.sub_daily_limit > 0 and \
+                        await self.db.sub_quota_used(igsid) + cost > self.s.sub_daily_limit:
+                    await self.safe_send(igsid, _t("You've reached today's fair-use limit for Unlimited ({n} searches) "
+                                                   "— it resets tomorrow 🙂", n=self.s.sub_daily_limit))
+                    return
 
                 try:
                     outcome = await self.run_search(action, user["last_media_url"], user["last_media_mid"] or "")
                 except MediaUnavailable as exc:
                     log.info("Media unavailable for %s: %s", igsid, exc)
-                    await self.safe_send(igsid, exc.user_message, QUICK_REPLIES if exc.user_message in
+                    await self.safe_send(igsid, exc.user_message, followup_replies(action) if exc.user_message in
                                          (MSG_NO_AUDIO, MSG_PHOTO_NO_AUDIO, MSG_NO_VIDEO) else None)
                     return
                 except ExternalServiceError as exc:
                     log.warning("External service failure for %s: %s", igsid, exc)
-                    await self.safe_send(igsid, MSG_OVERLOAD)
+                    await self.safe_send(igsid, MSG_OVERLOAD, QUICK_REPLIES)
                     return
 
                 if not outcome.any_found:
-                    await self.safe_send(igsid, MSG_OVERLOAD if outcome.any_failed else MSG_NOT_FOUND[action])
+                    if outcome.any_failed:
+                        await self.safe_send(igsid, MSG_OVERLOAD, QUICK_REPLIES)
+                    else:
+                        await self.safe_send(igsid, MSG_NOT_FOUND[action], followup_replies(action))
                     return
 
                 # Charge ONLY after a successful, non-empty answer.
@@ -3499,6 +3957,7 @@ class Bot:
                 new_balance: int | None = None
                 if subscribed:
                     footer = self.balance_line(user)
+                    await self.db.add_sub_quota(igsid, charge)
                 else:
                     new_balance = await self.db.charge(igsid, charge)
                     if new_balance is None:  # should not happen thanks to the per-user lock
@@ -3514,9 +3973,11 @@ class Bot:
                 blocks = [b.text for b in outcome.branches.values() if b.text]
                 blocks.append(footer)
                 cards = [c for b in outcome.branches.values() for c in b.cards][:10]
+                more = followup_replies(action)
                 if not cards:
-                    blocks.append("Want something else from this Reel? 👇")
-                    await self.safe_send(igsid, "\n\n".join(blocks), QUICK_REPLIES)
+                    if more:
+                        blocks.append(_t("Find something else? 👇"))
+                    await self.safe_send(igsid, "\n\n".join(blocks), more)
                 else:
                     await self.safe_send(igsid, "\n\n".join(blocks))
                     try:
@@ -3524,7 +3985,8 @@ class Bot:
                     except GraphAPIError as exc:
                         log.warning("Link buttons failed (%s) → sending links as text", exc)
                         await self.safe_send(igsid, cards_as_text(cards))
-                    await self.safe_send(igsid, "Want something else from this Reel? 👇", QUICK_REPLIES)
+                    if more:
+                        await self.safe_send(igsid, "Find something else? 👇", more)
                 if new_balance == 0:  # just used the last free search → offer the invite bonus
                     await self.safe_send(igsid, "🔋 That was your last free search.")
                     await self.send_invite(igsid)
@@ -3720,11 +4182,12 @@ class Bot:
                 log.exception("Inbox poll crashed")
             await asyncio.sleep(self.s.inbox_poll_sec + backoff)
 
-    async def _shazam_once(self, info: MediaInfo, workdir: Path, rate: float = 1.0) -> dict | None:
+    async def _shazam_once(self, info: MediaInfo, workdir: Path, rate: float = 1.0,
+                           start: float | None = None, clean: bool = False) -> dict | None:
         if not self.shazam:
             return None
         try:
-            wav = await extract_wav_clip(info, workdir, rate)
+            wav = await extract_wav_clip(info, workdir, rate, start=start, clean=clean)
         except MediaUnavailable as exc:
             log.info("Shazam clip skipped: %s", exc)
             return None
@@ -3803,15 +4266,21 @@ class Bot:
                 for task in pending:
                     task.cancel()
 
-            if self.shazam:  # 0.8 / 0.88 undo "sped up" edits, 1.2 undoes "slowed + reverb"
-                rates = (0.8, 0.88, 1.2)
-                variants = await asyncio.gather(*(self._shazam_once(info, workdir, r) for r in rates),
+            if self.shazam:  # 0.8 / 0.88 undo "sped up" edits, 1.2 undoes "slowed + reverb";
+                # plus a cleaned-up clip and another part of the video (bad audio, late chorus)
+                mid = max(info.duration / 2 - 6, 0) if info.duration >= 20 else None
+                attempts = [(0.8, None, False), (0.88, None, False), (1.2, None, False), (1.0, None, True)]
+                if mid is not None:
+                    attempts.append((1.0, mid, True))
+                variants = await asyncio.gather(*(self._shazam_once(info, workdir, r, st, cl) for r, st, cl in attempts),
                                                 return_exceptions=True)
-                for rate, res in zip(rates, variants, strict=True):
+                for (rate, _st, _cl), res in zip(attempts, variants, strict=True):
                     if res and not isinstance(res, BaseException):
-                        log.info("Song found by Shazam at speed x%.2f in %.1fs", 1 / rate, loop.time() - started)
-                        res["_note"] = _t("⚡ This Reel uses a sped-up version of:" if rate < 1
-                                          else "🐢 This Reel uses a slowed-down version of:")
+                        log.info("Song found by Shazam (speed x%.2f, start=%s, clean=%s) in %.1fs", 1 / rate, _st,
+                                 _cl, loop.time() - started)
+                        if rate != 1.0:
+                            res["_note"] = _t("⚡ This Reel uses a sped-up version of:" if rate < 1
+                                              else "🐢 This Reel uses a slowed-down version of:")
                         return res
             if ai_task:
                 res = await ai_task
@@ -4043,7 +4512,7 @@ what data we process, why, and how you can have it deleted.</p>
       We do not receive or store your name, email address or phone number.</li>
   <li><b>The link to the last media you sent us</b> and its type (video, photo or audio).</li>
   <li><b>Your search balance</b>, subscription end date (if any) and the date you first messaged us.</li>
-  <li><b>Payment records</b> — which package you bought and when, if paid plans are enabled.
+  <li><b>Payment records</b> — your Stripe customer ID, which package you bought and when, if paid plans are enabled.
       We never receive or store card details; payments are handled by our payment provider.</li>
   <li><b>Comments containing the word "FIND"</b> under our posts — used only to send you a private reply.
       We do not store the comment text.</li>
@@ -4073,7 +4542,7 @@ processing</b>, usually within seconds. We do not keep your videos or photos.</p
   <li><b>AudD</b> — an 8-second audio clip, to recognize the song.</li>
   <li><b>Railway</b> — server hosting (United States).</li>
   <li><b>Supabase</b> — database hosting (United States).</li>
-  <li><b>Our payment provider</b> — to process purchases, under its own privacy policy, if paid plans are enabled.</li>
+  <li><b>Stripe</b> — to process purchases (card details go only to Stripe, never to us), under its own privacy policy.</li>
 </ul>
 
 <h2>4. Why we process data</h2>
@@ -4182,6 +4651,14 @@ async def lifespan(app: FastAPI):
     refresh_task = asyncio.create_task(bot.token_refresh_loop())
     poll_task = asyncio.create_task(bot.inbox_poll_loop())
     await vision.discover_models()
+    if bot.stripe:
+        await bot.stripe.load_prices(list(settings.stripe_prices.values()))
+        if not settings.public_url:
+            log.error("Stripe is configured but PUBLIC_URL is unknown — set PUBLIC_URL=https://your-domain")
+        if not settings.stripe_webhook_secret:
+            log.error("STRIPE_WEBHOOK_SECRET is missing — payments will NOT be credited")
+        log.info("Stripe payments ON: %s", ", ".join(f"{k}={bot.stripe.price_labels.get(v, '?')}"
+                                                      for k, v in settings.stripe_prices.items()))
     if ReelExtractor.impersonation_available():
         log.info("Reel downloader: browser impersonation ON")
     else:
@@ -4296,6 +4773,77 @@ async def receive_webhook(request: Request, background: BackgroundTasks) -> Resp
             background.add_task(_run_safely, bot.handle_comment, value, own_id)
 
     return PlainTextResponse("EVENT_RECEIVED")
+
+
+_PAGE = string.Template("""<!DOCTYPE html><html lang="$lang"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>$title</title>
+<style>body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#0f0f12;color:#f2f2f2;display:flex;
+min-height:100vh;align-items:center;justify-content:center;margin:0;padding:24px;text-align:center}
+main{max-width:420px}h1{font-size:28px;margin:0 0 12px}p{color:#bdbdc7;line-height:1.5;margin:0 0 24px}
+a{display:inline-block;background:linear-gradient(90deg,#f58529,#dd2a7b,#8134af);color:#fff;text-decoration:none;
+padding:14px 26px;border-radius:14px;font-weight:600}</style></head>
+<body><main><h1>$title</h1><p>$text</p>$button</main></body></html>""")
+
+
+def _page(lang: str, title: str, text: str, link: str = "", status: int = 200) -> HTMLResponse:
+    token = CURRENT_LANG.set(lang if lang in LANGUAGES else "en")
+    try:
+        button = f'<a href="{html.escape(link)}">{html.escape(_t("Back to Instagram"))}</a>' if link else ""
+        body = _PAGE.substitute(lang=html.escape(lang), title=html.escape(_t(title)), text=html.escape(_t(text)),
+                                button=button)
+    finally:
+        CURRENT_LANG.reset(token)
+    return HTMLResponse(body, status_code=status, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+
+@app.get("/pay/{token}/{plan}")
+async def pay(token: str, plan: str) -> Response:
+    """Personal payment link from the bot → fresh Stripe Checkout (or Customer Portal) session."""
+    assert bot is not None
+    user = await bot.db.user_by_pay_token(token) if bot.stripe else None
+    if not user or plan not in ("s", "l", "m", "y", "manage"):
+        return _page("en", "🤔", "This payment link is invalid. Open a fresh one from the bot.", status=404)
+    try:
+        url = await bot.checkout_url(user, plan)
+    except StripeError as exc:
+        log.error("Checkout for %s (%s) failed: %s", user["igsid"], plan, exc)
+        url = ""
+    if not url:
+        return _page(user["lang"] or "en", "😕", "Payments are temporarily unavailable. Please try again in a "
+                                                 "few minutes.", bot.bot_link(), status=503)
+    return RedirectResponse(url, status_code=303, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/paid")
+async def paid(t: str = "", ok: str = "1") -> HTMLResponse:
+    assert bot is not None
+    user = await bot.db.user_by_pay_token(t)
+    lang = (user["lang"] if user else None) or "en"
+    link = bot.bot_link() if bot.s.instagram_handle else ""
+    if ok == "0":
+        return _page(lang, "👌", "Payment cancelled — nothing was charged.", link)
+    return _page(lang, "✅ Payment received!", "Go back to Instagram — your purchase is already active.", link)
+
+
+@app.post("/stripe-webhook")
+async def stripe_webhook(request: Request) -> Response:
+    raw = await request.body()
+    assert bot is not None
+    if not bot.stripe or not bot.s.stripe_webhook_secret:
+        return JSONResponse({"error": "stripe is not configured"}, status_code=503)
+    if not verify_stripe_signature(raw, request.headers.get("stripe-signature", ""), bot.s.stripe_webhook_secret):
+        log.warning("Rejected Stripe webhook: bad signature")
+        return JSONResponse({"error": "invalid signature"}, status_code=400)
+    try:
+        event = json.loads(raw)
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+    try:
+        result = await bot.handle_stripe_event(event)
+    except Exception:  # noqa: BLE001 — non-2xx makes Stripe retry later
+        log.exception("Stripe event %s (%s) failed", event.get("id"), event.get("type"))
+        return JSONResponse({"error": "processing failed"}, status_code=500)
+    return JSONResponse({"status": result})
 
 
 @app.post("/payment-webhook")
