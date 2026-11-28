@@ -951,7 +951,7 @@ UNSUPPORTED_LINK_DOMAINS = (
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 FIND_KEYWORD_RE = re.compile(r"\bfind\b", re.IGNORECASE)
 
-BUILD = "2026-11-28 polish"  # shown in the startup log to confirm which code is deployed
+BUILD = "2026-11-28 prints-grammar"  # shown in the startup log to confirm which code is deployed
 IG_TEXT_LIMIT = 950  # Instagram text messages must be < 1000 characters
 
 
@@ -2596,6 +2596,8 @@ ITEMS_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "properties": {
+                    "name": {"type": "string", "description": "Short natural name, grammatically correct"},
+                    "print": {"type": "string", "description": "Exact text / graphic printed on it, or empty"},
                     "category": {"type": "string"},
                     "brand": {"type": "string"},
                     "model": {"type": "string"},
@@ -2604,7 +2606,7 @@ ITEMS_SCHEMA: dict[str, Any] = {
                     "search_query": {"type": "string"},
                     "confidence": {"type": "number"},
                 },
-                "required": ["category", "brand", "description", "search_query", "confidence"],
+                "required": ["name", "category", "brand", "print", "description", "search_query", "confidence"],
             },
         },
     },
@@ -2646,7 +2648,14 @@ _ITEMS_RULES = (
     "brand (only if a logo/design makes it identifiable, otherwise 'Unknown'), model name if recognisable "
     "(else empty), main color (1 word), description (max 6 words, only what tells it apart, e.g. "
     "'cropped, with a back print'; empty if nothing notable), and a precise shopping search query "
-    "(brand + model + color + item type, or a descriptive query if brand is unknown). confidence is 0..1. found=false if nothing identifiable is visible. "
+    "(brand + model + color + item type, or a descriptive query if brand is unknown). "
+    "PRINTS: read any print, slogan, logo text or graphic on clothes and accessories carefully, letter by letter, "
+    "even if you don't recognise it; put the exact text in `print` (or a 2-4 word description of a graphic, "
+    "e.g. 'skull with roses'), and add it to search_query in quotes. "
+    "`name`: how a person would call the item in 2-6 words — colour + item, plus brand/model if known and the "
+    "print if there is one (e.g. 'Black T-shirt with a “Nirvana” print', 'Nike Dunk Low sneakers'). "
+    "It must be grammatically correct in the output language: adjectives agree in gender and number with the "
+    "noun, natural word order. confidence is 0..1. found=false if nothing identifiable is visible. "
     "Prioritise distinctive things (gear, gadgets, instruments, sneakers, bags, watches, statement pieces) over "
     "generic basics like plain black pants. For instruments, synthesizers, electronics, cameras, cars, watches "
     "and sneakers try hard to name the exact make and model: read logos and model names printed on the device, "
@@ -2760,9 +2769,10 @@ class VisionClient:
             prompt += "\n\nContext from the Reel (may help, may be unrelated):\n" + context[:800]
         lang = CURRENT_LANG.get()
         if lang != "en" and lang in LANGUAGES:
-            prompt += (f"\n\nWrite all descriptive text values (scene, description, color, category, kind) in "
-                       f"{LANGUAGES[lang][1]}. Keep proper names (titles, brands, models, actors) unchanged and "
-                       "keep search_query in English.")
+            prompt += (f"\n\nWrite all descriptive text values (name, scene, description, color, category, kind) in "
+                       f"{LANGUAGES[lang][1]}, grammatically correct (gender, number and case agreement, natural word "
+                       "order — e.g. Russian 'чёрная футболка', not 'черный футболка'). Keep proper names (titles, "
+                       "brands, models, actors) and printed text unchanged, and keep search_query in English.")
         contents: list[Any] = [genai_types.Part.from_bytes(data=f, mime_type="image/jpeg") for f in frames]
         contents.append(prompt)
         try:
@@ -3100,6 +3110,9 @@ def item_names(items: list[dict]) -> list[str]:
     items would otherwise look the same."""
     names = []
     for it in items:
+        if _s(it.get("name")):  # written by the AI in the user's language, grammatically correct
+            names.append(_s(it.get("name"))[:1].upper() + _s(it.get("name"))[1:80])
+            continue
         brand = _s(it.get("brand"))
         brand = "" if brand.lower() in ("unknown", "n/a", "none", "-") else brand
         model, category, color = _s(it.get("model")), _s(it.get("category")).lower(), _s(it.get("color")).lower()
