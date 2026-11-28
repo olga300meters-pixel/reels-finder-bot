@@ -502,6 +502,15 @@ _L("👋 DM me any Reel — I find songs, movies, outfits & places!",
    "👋 Надішли мені будь-який Reels у директ — знаходжу пісні, фільми, одяг і місця!",
    "👋 Пришли мне любой Reels в директ — нахожу песни, фильмы, одежду и места!")
 
+_L("🎬 Movie/show: not identified", "🎬 Película/serie: no identificada", "🎬 Filme/série: não identificado",
+   "🎬 Film/Serie: nicht erkannt", "🎬 Film/série : non identifié", "🎬 Film/serie: non identificato",
+   "🎬 Фільм/серіал: не визначено", "🎬 Фильм/сериал: не определён")
+_L("👕 Items: nothing identifiable", "👕 Objetos: nada identificable", "👕 Itens: nada identificável",
+   "👕 Sachen: nichts Erkennbares", "👕 Objets : rien d'identifiable", "👕 Oggetti: niente di riconoscibile",
+   "👕 Речі: нічого не знайдено", "👕 Вещи: ничего не найдено")
+_L("📍 Place: not recognised", "📍 Lugar: no reconocido", "📍 Lugar: não reconhecido", "📍 Ort: nicht erkannt",
+   "📍 Lieu : non reconnu", "📍 Luogo: non riconosciuto", "📍 Місце: не впізнано", "📍 Место: не распознано")
+
 # Typed commands in every language (Quick Replies aren't shown on Instagram desktop)
 LOCAL_TEXT_COMMANDS = {
     "canción": "FIND_MUSIC", "cancion": "FIND_MUSIC", "música": "FIND_MUSIC", "musica": "FIND_MUSIC",
@@ -847,7 +856,7 @@ UNSUPPORTED_LINK_DOMAINS = (
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 FIND_KEYWORD_RE = re.compile(r"\bfind\b", re.IGNORECASE)
 
-BUILD = "2026-11-28 calm-poll"  # shown in the startup log to confirm which code is deployed
+BUILD = "2026-11-28 sharper-search-2"  # shown in the startup log to confirm which code is deployed
 IG_TEXT_LIMIT = 950  # Instagram text messages must be < 1000 characters
 
 
@@ -2089,7 +2098,7 @@ async def extract_audio_clip(info: MediaInfo, workdir: Path) -> bytes:
     return out.read_bytes()
 
 
-async def extract_wav_clip(info: MediaInfo, workdir: Path, rate: float = 1.0) -> bytes:
+async def extract_wav_clip(info: MediaInfo, workdir: Path, rate: float = 1.0, seconds: int = 12) -> bytes:
     """12 s mono 16 kHz WAV for Shazam. rate != 1 plays it faster/slower WITH pitch change:
     that undoes "sped up" / "slowed" edits, so the original track can be matched."""
     start = 1.0 if info.duration >= 14.0 else 0.0
@@ -2098,7 +2107,7 @@ async def extract_wav_clip(info: MediaInfo, workdir: Path, rate: float = 1.0) ->
     rc, _, err = await run_cmd(
         ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
          "-ss", f"{start:.2f}", "-i", str(info.path), "-vn", *af,
-         "-ac", "1", "-ar", "16000", "-t", "12", "-f", "wav", str(out)],
+         "-ac", "1", "-ar", "16000", "-t", str(seconds), "-f", "wav", str(out)],
         timeout=15,
     )
     if rc != 0 or not out.exists() or out.stat().st_size < 1000:
@@ -2106,11 +2115,11 @@ async def extract_wav_clip(info: MediaInfo, workdir: Path, rate: float = 1.0) ->
     return out.read_bytes()
 
 
-async def _grab_frame(src: Path, at: float, out: Path) -> bytes | None:
+async def _grab_frame(src: Path, at: float, out: Path, width: int = 640) -> bytes | None:
     """Grabs one frame. Fast path decodes only the nearest keyframe (~3x less CPU,
     matters on 0.1-0.5 vCPU free instances); falls back to an exact seek."""
     base = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
-    tail = ["-frames:v", "1", "-vf", "scale=640:-1", "-q:v", "4", "-update", "1", str(out)]
+    tail = ["-frames:v", "1", "-vf", f"scale='min({width},iw)':-2", "-q:v", "3", "-update", "1", str(out)]
     ss = ["-ss", f"{at:.2f}"] if at > 0 else []
     attempts = [
         base + ["-skip_frame", "nokey"] + ss + ["-noaccurate_seek", "-i", str(src)] + tail,
@@ -2126,8 +2135,9 @@ async def _grab_frame(src: Path, at: float, out: Path) -> bytes | None:
     return None
 
 
-async def extract_frames(info: MediaInfo, workdir: Path) -> list[bytes]:
-    """3 JPEG frames at 20/50/80% of the duration, 640px wide (1 frame for photos)."""
+async def extract_frames(info: MediaInfo, workdir: Path, width: int = 640) -> list[bytes]:
+    """3 JPEG frames at 20/50/80% of the duration (1 frame for photos). Item search uses wider
+    frames so logos and printed model names stay readable."""
     if info.kind == "audio":
         raise MediaUnavailable(MSG_NO_VIDEO, "audio-only media")
     if info.kind == "image" or info.duration < 0.5:
@@ -2135,7 +2145,7 @@ async def extract_frames(info: MediaInfo, workdir: Path) -> list[bytes]:
     else:
         timestamps = [info.duration * p for p in (0.2, 0.5, 0.8)]
     results = await asyncio.gather(
-        *(_grab_frame(info.path, t, workdir / f"frame_{i}.jpg") for i, t in enumerate(timestamps))
+        *(_grab_frame(info.path, t, workdir / f"frame_{i}.jpg", width) for i, t in enumerate(timestamps))
     )
     frames = [f for f in results if f]
     if not frames:
@@ -2196,28 +2206,51 @@ def _norm(text: str) -> str:
     return re.sub(r"[^\w]+", " ", text).strip()
 
 
+_CYR = dict(zip("абвгдеёжзийклмнопрстуфхцчшщъыьэюяіїєґ",
+                ["a", "b", "v", "g", "d", "e", "e", "zh", "z", "i", "y", "k", "l", "m", "n", "o", "p", "r", "s",
+                 "t", "u", "f", "kh", "ts", "ch", "sh", "shch", "", "y", "", "e", "yu", "ya", "i", "yi", "ye", "g"],
+                strict=True))
+
+
+def _translit(text: str) -> str:
+    return "".join(_CYR.get(ch, ch) for ch in text.lower())
+
+
 def _similar(a: str, b: str) -> float:
+    """0..1; Cyrillic and Latin spellings of the same name count as similar (Пошлая ≈ Poshlaya)."""
     from difflib import SequenceMatcher
 
     a, b = _norm(a), _norm(b)
     if not a or not b:
         return 0.0
-    if a in b or b in a:
-        return 1.0
-    return SequenceMatcher(None, a, b).ratio()
+    best = 0.0
+    for x, y in ((a, b), (_translit(a), _translit(b))):
+        x, y = x.replace("kh", "h").replace("j", "y"), y.replace("kh", "h").replace("j", "y")
+        if x in y or y in x:
+            return 1.0
+        best = max(best, SequenceMatcher(None, x, y).ratio())
+    return best
 
 
 async def verify_song_itunes(http: httpx.AsyncClient, artist: str, title: str) -> dict | None:
     """Checks that the AI's answer is a real released track (free iTunes Search API, no key).
     Returns an AudD-shaped result with canonical names + Apple Music link, or None."""
-    try:
-        resp = await http.get("https://itunes.apple.com/search",
-                              params={"term": f"{artist} {title}"[:200], "entity": "song", "limit": 15},
-                              timeout=httpx.Timeout(5.0, connect=3.0))
-        items = resp.json().get("results") or [] if resp.status_code == 200 else []
-    except (httpx.HTTPError, ValueError) as exc:
-        log.info("iTunes verification unavailable: %s", exc)
-        return None
+    # US catalogue + the user's local one (Russian/Brazilian/… artists may only be listed there)
+    local = {"ru": "ru", "uk": "ua", "es": "es", "pt": "br", "de": "de", "fr": "fr", "it": "it"}.get(CURRENT_LANG.get())
+    countries = ["us"] + ([local] if local else [])
+
+    async def search(country: str) -> list[dict]:
+        try:
+            resp = await http.get("https://itunes.apple.com/search",
+                                  params={"term": f"{artist} {title}"[:200], "entity": "song", "limit": 15,
+                                          "country": country},
+                                  timeout=httpx.Timeout(5.0, connect=3.0))
+            return resp.json().get("results") or [] if resp.status_code == 200 else []
+        except (httpx.HTTPError, ValueError) as exc:
+            log.info("iTunes verification (%s) unavailable: %s", country, exc)
+            return []
+
+    items = [it for batch in await asyncio.gather(*(search(c) for c in countries)) for it in batch]
     best, best_score = None, 0.0
     for it in items:
         t_score = _similar(title, _s(it.get("trackName")))
@@ -2355,7 +2388,13 @@ _ITEMS_RULES = (
     "eyewear, jewellery or notable products. For each: category, brand (only if a logo/design makes it "
     "identifiable, otherwise 'Unknown'), model name if recognisable (else empty), main color, a short "
     "description, and a precise shopping search query (brand + model + color + item type, or a descriptive "
-    "query if brand is unknown). confidence is 0..1. found=false if nothing identifiable is visible."
+    "query if brand is unknown). confidence is 0..1. found=false if nothing identifiable is visible. "
+    "Prioritise distinctive things (gear, gadgets, instruments, sneakers, bags, watches, statement pieces) over "
+    "generic basics like plain black pants. For instruments, synthesizers, electronics, cameras, cars, watches "
+    "and sneakers try hard to name the exact make and model: read logos and model names printed on the device, "
+    "and use distinctive design (layout and number of keys/knobs/pads/screens, colour scheme, shape). "
+    "If you know the brand but can only narrow the model down to 2-3 candidates, put them in `model` "
+    "(e.g. 'MODX6 or Montage 6') instead of leaving it empty."
 )
 _PLACE_RULES = (
     "PLACE TASK: Identify where this was filmed: a specific landmark, city, beach, restaurant, hotel, street or "
@@ -2393,7 +2432,7 @@ SONG_SCHEMA = {
 }
 
 
-def song_prompt(caption: str, audio_label: str) -> str:
+def song_prompt(caption: str, audio_label: str, has_frame: bool = False) -> str:
     ctx = []
     if audio_label:
         ctx.append(f"Instagram audio label: {audio_label}")
@@ -2404,9 +2443,16 @@ def song_prompt(caption: str, audio_label: str) -> str:
         "You are a music identification expert. Identify the song playing in this audio clip from an "
         "Instagram Reel. Audio fingerprinting (Shazam) already failed, so it is probably a remix, "
         "sped-up/slowed edit, phonk/funk edit, cover or mashup — identify the ORIGINAL track it is based on "
-        "(recognise the melody, hook, vocals, lyrics or sample).\n"
+        "(recognise the melody, hook, vocals, lyrics or sample). Instrumental covers (piano, synth, guitar, "
+        "violin…) are common: name the song whose MELODY is being played. Songs can be from any country "
+        "(Russian, Ukrainian, Latin, K-pop, Turkish, Arabic…).\n"
+        + ("You also get a frame from the video: on-screen text, the performer or the instrument may help.\n"
+           if has_frame else "")
+        + 
         "Context (often names the track or credits it with 🎵, 'song:', '#songname'; may also be unrelated):\n"
         f"{context}\n\n"
+        "Write artist and title exactly as on Spotify / Apple Music, in the original script "
+        "(e.g. Cyrillic for Russian artists). "
         "Rules: never invent a song. If you can't name a real released track, return found=false. "
         "confidence must reflect real certainty (0.9 = you clearly recognise it)."
     )
@@ -2462,19 +2508,22 @@ class VisionClient:
         contents: list[Any] = [genai_types.Part.from_bytes(data=f, mime_type="image/jpeg") for f in frames]
         contents.append(prompt)
         try:
-            return await self._generate(contents, schema)
+            return await self._generate(contents, schema, hi_res=task in (FIND_ITEM, FIND_ALL))
         except ExternalServiceError as exc:
             if not self._backup:
                 raise
             log.warning("%s → trying backup AI %s", exc, self._backup[2])
             return await self._backup_generate(frames, prompt, schema, str(exc))
 
-    async def identify_song(self, wav: bytes, caption: str, audio_label: str) -> dict:
-        contents: list[Any] = [genai_types.Part.from_bytes(data=wav, mime_type="audio/wav"),
-                               song_prompt(caption, audio_label)]
+    async def identify_song(self, wav: bytes, caption: str, audio_label: str,
+                            frames: list[bytes] | None = None) -> dict:
+        contents: list[Any] = [genai_types.Part.from_bytes(data=wav, mime_type="audio/wav")]
+        contents += [genai_types.Part.from_bytes(data=f, mime_type="image/jpeg") for f in frames or []]
+        contents.append(song_prompt(caption, audio_label, bool(frames)))
         return await self._generate(contents, SONG_SCHEMA)
 
-    async def _call_model(self, model: str, contents: list[Any], schema: dict, timeout: float) -> dict:
+    async def _call_model(self, model: str, contents: list[Any], schema: dict, timeout: float,
+                          hi_res: bool = False) -> dict:
         """One Gemini attempt. Returns parsed JSON or raises _ModelFailed(reason)."""
         started = asyncio.get_running_loop().time()
         tuned = True  # minimal thinking + medium image detail = much faster; plain call if rejected
@@ -2482,7 +2531,8 @@ class VisionClient:
             extra: dict[str, Any] = {}
             if tuned:
                 extra = {"thinking_config": self._thinking_config(model),
-                         "media_resolution": genai_types.MediaResolution.MEDIA_RESOLUTION_MEDIUM}
+                         "media_resolution": genai_types.MediaResolution.MEDIA_RESOLUTION_HIGH if hi_res
+                         else genai_types.MediaResolution.MEDIA_RESOLUTION_MEDIUM}
             config = genai_types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_json_schema=schema,
@@ -2519,7 +2569,7 @@ class VisionClient:
             return data
         raise _ModelFailed(f"{model}: request rejected")
 
-    async def _generate(self, contents: list[Any], schema: dict) -> dict:
+    async def _generate(self, contents: list[Any], schema: dict, hi_res: bool = False) -> dict:
         """Hedged fallback chain: start the 1st model; if it is slow (> HEDGE_SEC) or fails, start the
         next one in parallel; the first good answer wins, the rest are cancelled."""
         loop = asyncio.get_running_loop()
@@ -2533,7 +2583,7 @@ class VisionClient:
             if not queue or left < 3:
                 return False
             model = queue.pop(0)
-            task = asyncio.create_task(self._call_model(model, contents, schema, min(self._timeout, left)))
+            task = asyncio.create_task(self._call_model(model, contents, schema, min(self._timeout, left), hi_res))
             pending[task] = model
             return True
 
@@ -3683,8 +3733,11 @@ class Bot:
     async def _ai_song(self, info: MediaInfo, workdir: Path, caption: str, label: str) -> dict | None:
         """Gemini listens to the clip (+ caption / audio label) → guess → verified in iTunes catalog."""
         try:
-            wav = await extract_wav_clip(info, workdir)
-            data = await self.vision.identify_song(wav, caption, label)
+            wav, frame = await asyncio.gather(
+                extract_wav_clip(info, workdir, seconds=25),  # longer clip = melody is easier to recognise
+                _grab_frame(info.path, info.duration * 0.5, workdir / "song_frame.jpg")
+                if info.kind == "video" else asyncio.sleep(0, result=None))
+            data = await self.vision.identify_song(wav, caption, label, [frame] if frame else None)
         except (MediaUnavailable, ExternalServiceError) as exc:
             log.warning("AI song search failed: %s", exc)
             return None
@@ -3807,9 +3860,24 @@ class Bot:
             if hint.caption:
                 parts.append(f"Caption: {hint.caption}")
             context = "\n".join(parts)
+        missing: list[str] = []
         try:
-            frames = await extract_frames(info, workdir)
-            data = await self.vision.analyze(action, frames, context)
+            frames = await extract_frames(info, workdir, 960 if action in (FIND_ITEM, FIND_ALL) else 640)
+            if action == FIND_ALL:
+                # Three focused requests in parallel instead of one big one: each task gets the
+                # model's full attention (better answers), and it takes no longer.
+                got = await asyncio.gather(*(self.vision.analyze(t, frames, context)
+                                             for t in (FIND_MOVIE, FIND_ITEM, FIND_PLACE)), return_exceptions=True)
+                errors = [g for g in got if isinstance(g, BaseException)]
+                for g in errors:
+                    if not isinstance(g, ExternalServiceError):
+                        raise g
+                if len(errors) == 3:
+                    raise errors[0]
+                data = {"movie": got[0], "items": got[1], "place": got[2]}
+                data = {k: ({} if isinstance(v, BaseException) else v) for k, v in data.items()}
+            else:
+                data = await self.vision.analyze(action, frames, context)
         except MediaUnavailable:
             if strict:
                 raise
@@ -3822,6 +3890,12 @@ class Bot:
 
         if action == FIND_ALL:
             movie, items, place = data.get("movie") or {}, filter_items(data.get("items") or {}), data.get("place") or {}
+            if not movie_is_found(movie):
+                missing.append(_t("🎬 Movie/show: not identified"))
+            if not items:
+                missing.append(_t("👕 Items: nothing identifiable"))
+            if not place_is_found(place):
+                missing.append(_t("📍 Place: not recognised"))
         else:
             movie = data if action == FIND_MOVIE else {}
             items = filter_items(data) if action == FIND_ITEM else []
@@ -3855,6 +3929,8 @@ class Bot:
             res.finds.append(("place", _s(place.get("name")), place_where(place), card["buttons"][0]["url"]))
             summaries.append(f"📍 {_s(place.get('name'))}" + (f", {place_where(place)}" if place_where(place) else ""))
         res.found = bool(texts)
+        if res.found and missing:
+            texts.append("\n".join(missing))
         res.text = "\n\n".join(texts)
         res.summary = "\n".join(summaries)
         return res
