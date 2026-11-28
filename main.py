@@ -17,6 +17,8 @@ de-duplication and per-user locks live in process memory.
 from __future__ import annotations
 
 import asyncio
+import contextvars
+from collections import deque
 import hashlib
 import html
 import ipaddress
@@ -132,6 +134,11 @@ class Settings:
     allow_private_urls: bool
     # Reel downloader (yt-dlp)
     admin_code: str
+    ask_language: bool
+    referral_credits: int
+    referral_daily_cap: int
+    mentions_enabled: bool
+    mentions_per_hour: int
     ig_cookies: str
     download_proxy: str
     # Shazam (second recogniser; better for phonk / TikTok-style remixes)
@@ -191,6 +198,14 @@ class Settings:
             # Secret for the DM command "admin <code> <credits>" (adds test credits to yourself).
             # Empty = admin command disabled. Use 16+ random characters.
             admin_code=_env("ADMIN_CODE", ""),
+            # New users pick a language with flag buttons first (0 = everyone gets English).
+            ask_language=_env("ASK_LANGUAGE", "1").lower() not in ("0", "false", "no"),
+            # Invite a friend → both get this many credits; max rewarded invites per person per day.
+            referral_credits=_env_int("REFERRAL_CREDITS", 3),
+            referral_daily_cap=_env_int("REFERRAL_DAILY_CAP", 10),
+            # Answer @mentions in comments under other people's Reels (free, rate-limited).
+            mentions_enabled=_env("MENTIONS_ENABLED", "1").lower() not in ("0", "false", "no"),
+            mentions_per_hour=_env_int("MENTIONS_PER_HOUR", 20),
             ig_cookies=_env("IG_COOKIES", ""),
             download_proxy=_env("DOWNLOAD_PROXY", ""),
             shazam_enabled=_env("SHAZAM_ENABLED", "1").lower() not in ("0", "false", "no"),
@@ -207,14 +222,309 @@ FIND_MUSIC = "FIND_MUSIC"
 FIND_MOVIE = "FIND_MOVIE"
 FIND_ITEM = "FIND_ITEM"
 FIND_ALL = "FIND_ALL"
-ACTIONS = {FIND_MUSIC, FIND_MOVIE, FIND_ITEM, FIND_ALL}
-ACTION_COST = {FIND_MUSIC: 1, FIND_MOVIE: 1, FIND_ITEM: 1, FIND_ALL: 2}
+FIND_PLACE = "FIND_PLACE"
+ACTIONS = {FIND_MUSIC, FIND_MOVIE, FIND_ITEM, FIND_PLACE, FIND_ALL}
+ACTION_COST = {FIND_MUSIC: 1, FIND_MOVIE: 1, FIND_ITEM: 1, FIND_PLACE: 1, FIND_ALL: 2}
+MY_LISTS = "MY_LISTS"
+INVITE = "INVITE"
+LIST_KINDS = ("song", "movie", "item", "place")
+
+# =============================================================================
+# Languages: the user picks one with flag buttons on first contact (or sends "language").
+# Bot texts are translated here; Gemini writes its descriptions in the same language.
+# =============================================================================
+LANGUAGES = {  # code: (button title, English name for the AI prompt)
+    "en": ("🇬🇧 English", "English"),
+    "es": ("🇪🇸 Español", "Spanish"),
+    "pt": ("🇧🇷 Português", "Brazilian Portuguese"),
+    "de": ("🇩🇪 Deutsch", "German"),
+    "fr": ("🇫🇷 Français", "French"),
+    "it": ("🇮🇹 Italiano", "Italian"),
+    "uk": ("🇺🇦 Українська", "Ukrainian"),
+    "ru": ("🇷🇺 Русский", "Russian"),
+}
+_TR_ORDER = ("es", "pt", "de", "fr", "it", "uk", "ru")
+TR: dict[str, dict[str, str]] = {}
+CURRENT_LANG: contextvars.ContextVar[str] = contextvars.ContextVar("lang", default="en")
+
+
+def _L(en: str, *others: str) -> str:
+    assert len(others) == len(_TR_ORDER), en
+    TR[en] = dict(zip(_TR_ORDER, others, strict=True))
+    return en
+
+
+def _t(text: str, **kw: Any) -> str:
+    """Translates an English bot text into the current user's language (unknown text → as is)."""
+    lang = CURRENT_LANG.get()
+    out = TR.get(text, {}).get(lang, text) if lang != "en" else text
+    return out.format(**kw) if kw else out
+
+
+def lang_picker() -> list[dict]:
+    return [{"content_type": "text", "title": title, "payload": f"LANG_{code}"}
+            for code, (title, _) in LANGUAGES.items()]
+
+
+MSG_CHOOSE_LANG = "🌍 Choose your language 👇"
+LANGUAGE_COMMANDS = {"language", "lang", "languages", "idioma", "língua", "lingua", "sprache", "langue",
+                     "мова", "язык", "change language", "/language", "🌍"}
+MSG_LANG_SET = _L(
+    "✅ English it is! (send “language” to change)",
+    "✅ ¡Español activado! (escribe “idioma” para cambiar)",
+    "✅ Português ativado! (envie “idioma” para trocar)",
+    "✅ Deutsch aktiviert! (schreib „Sprache“ zum Ändern)",
+    "✅ Français activé ! (envoie « langue » pour changer)",
+    "✅ Italiano attivato! (scrivi “lingua” per cambiare)",
+    "✅ Українську увімкнено! (напиши «мова», щоб змінити)",
+    "✅ Русский включён! (напиши «язык», чтобы сменить)",
+)
+# Quick-reply titles (Instagram limit: 20 characters)
+_L("🎵 Find Song", "🎵 Buscar canción", "🎵 Achar música", "🎵 Song finden", "🎵 La chanson",
+   "🎵 Trova canzone", "🎵 Знайти пісню", "🎵 Найти песню")
+_L("🎬 Find Movie", "🎬 Buscar película", "🎬 Achar filme", "🎬 Film finden", "🎬 Le film",
+   "🎬 Trova film", "🎬 Знайти фільм", "🎬 Найти фильм")
+_L("👕 Find Outfit/Item", "👕 Ropa/objetos", "👕 Roupa/itens", "👕 Outfit/Sachen", "👕 Tenue/objets",
+   "👕 Outfit/oggetti", "👕 Одяг/речі", "👕 Одежда/вещи")
+_L("🔥 Find Everything", "🔥 Buscar todo", "🔥 Achar tudo", "🔥 Alles finden", "🔥 Tout trouver",
+   "🔥 Trova tutto", "🔥 Знайти все", "🔥 Найти всё")
+# Link-button cards
+_L("📺 Where to watch", "📺 Dónde ver", "📺 Onde assistir", "📺 Wo streamen", "📺 Où regarder",
+   "📺 Dove guardarlo", "📺 Де дивитися", "📺 Где смотреть")
+_L("🎞 Trailer", "🎞 Tráiler", "🎞 Trailer", "🎞 Trailer", "🎞 Bande-annonce", "🎞 Trailer",
+   "🎞 Трейлер", "🎞 Трейлер")
+_L("Where to watch & details", "Dónde verla y detalles", "Onde assistir e detalhes", "Wo streamen & Details",
+   "Où regarder & détails", "Dove guardarlo e dettagli", "Де дивитися та деталі", "Где смотреть и подробности")
+# Result texts
+_L("🎵 Song found!", "🎵 ¡Canción encontrada!", "🎵 Música encontrada!", "🎵 Song gefunden!",
+   "🎵 Chanson trouvée !", "🎵 Canzone trovata!", "🎵 Пісню знайдено!", "🎵 Песня найдена!")
+_L("⚡ This Reel uses a sped-up version of:", "⚡ Este Reel usa una versión acelerada de:",
+   "⚡ Este Reel usa uma versão acelerada de:", "⚡ Dieses Reel nutzt eine schnellere Version von:",
+   "⚡ Ce Reel utilise une version accélérée de :", "⚡ Questo Reel usa una versione accelerata di:",
+   "⚡ У цьому Reels прискорена версія:", "⚡ В этом Reels ускоренная версия:")
+_L("🐢 This Reel uses a slowed-down version of:", "🐢 Este Reel usa una versión ralentizada de:",
+   "🐢 Este Reel usa uma versão desacelerada de:", "🐢 Dieses Reel nutzt eine langsamere Version von:",
+   "🐢 Ce Reel utilise une version ralentie de :", "🐢 Questo Reel usa una versione rallentata di:",
+   "🐢 У цьому Reels уповільнена версія:", "🐢 В этом Reels замедленная версия:")
+_L("🎛 This Reel uses a {v} of:", "🎛 Este Reel usa una versión ({v}) de:", "🎛 Este Reel usa uma versão ({v}) de:",
+   "🎛 Dieses Reel nutzt eine Version ({v}) von:", "🎛 Ce Reel utilise une version ({v}) de :",
+   "🎛 Questo Reel usa una versione ({v}) di:", "🎛 У цьому Reels версія ({v}):", "🎛 В этом Reels версия ({v}):")
+_L("🤔 Most likely:", "🤔 Lo más probable:", "🤔 Provavelmente:", "🤔 Wahrscheinlich:", "🤔 Très probablement :",
+   "🤔 Molto probabilmente:", "🤔 Найімовірніше:", "🤔 Скорее всего:")
+_L("🎬 It's from:", "🎬 Es de:", "🎬 É de:", "🎬 Das ist aus:", "🎬 Ça vient de :", "🎬 Viene da:",
+   "🎬 Це з:", "🎬 Это из:")
+_L("Movie", "Película", "Filme", "Film", "Film", "Film", "Фільм", "Фильм")
+_L("TV series", "Serie", "Série", "Serie", "Série", "Serie TV", "Серіал", "Сериал")
+_L("Anime", "Anime", "Anime", "Anime", "Anime", "Anime", "Аніме", "Аниме")
+_L("Documentary", "Documental", "Documentário", "Doku", "Documentaire", "Documentario", "Документальний",
+   "Документальный")
+_L("Music video", "Videoclip", "Videoclipe", "Musikvideo", "Clip", "Video musicale", "Кліп", "Клип")
+_L("🎭 Cast: {x}", "🎭 Reparto: {x}", "🎭 Elenco: {x}", "🎭 Besetzung: {x}", "🎭 Casting : {x}", "🎭 Cast: {x}",
+   "🎭 У ролях: {x}", "🎭 В ролях: {x}")
+_L("📍 Scene: {x}", "📍 Escena: {x}", "📍 Cena: {x}", "📍 Szene: {x}", "📍 Scène : {x}", "📍 Scena: {x}",
+   "📍 Сцена: {x}", "📍 Сцена: {x}")
+_L("⏱ Moment: {x}", "⏱ Momento: {x}", "⏱ Momento: {x}", "⏱ Moment: {x}", "⏱ Moment : {x}", "⏱ Momento: {x}",
+   "⏱ Момент: {x}", "⏱ Момент: {x}")
+_L("🎯 Confidence: high", "🎯 Confianza: alta", "🎯 Confiança: alta", "🎯 Sicherheit: hoch",
+   "🎯 Confiance : élevée", "🎯 Affidabilità: alta", "🎯 Впевненість: висока", "🎯 Уверенность: высокая")
+_L("🎯 Confidence: medium", "🎯 Confianza: media", "🎯 Confiança: média", "🎯 Sicherheit: mittel",
+   "🎯 Confiance : moyenne", "🎯 Affidabilità: media", "🎯 Впевненість: середня", "🎯 Уверенность: средняя")
+_L("👕 Items spotted:", "👕 Objetos encontrados:", "👕 Itens encontrados:", "👕 Gefundene Sachen:",
+   "👕 Objets repérés :", "👕 Oggetti trovati:", "👕 Знайдені речі:", "👕 Найденные вещи:")
+_L("🎵 Song: search temporarily unavailable", "🎵 Canción: búsqueda no disponible por ahora",
+   "🎵 Música: busca indisponível no momento", "🎵 Song: Suche gerade nicht verfügbar",
+   "🎵 Chanson : recherche indisponible pour l'instant", "🎵 Canzone: ricerca momentaneamente non disponibile",
+   "🎵 Пісня: пошук тимчасово недоступний", "🎵 Песня: поиск временно недоступен")
+_L("🎵 Song: not recognised", "🎵 Canción: no reconocida", "🎵 Música: não reconhecida", "🎵 Song: nicht erkannt",
+   "🎵 Chanson : non reconnue", "🎵 Canzone: non riconosciuta", "🎵 Пісня: не розпізнано",
+   "🎵 Песня: не распознана")
+_L("🎬 Movie & 👕 items: temporarily unavailable", "🎬 Película y 👕 objetos: no disponible por ahora",
+   "🎬 Filme e 👕 itens: indisponível no momento", "🎬 Film & 👕 Sachen: gerade nicht verfügbar",
+   "🎬 Film & 👕 objets : indisponible pour l'instant", "🎬 Film e 👕 oggetti: momentaneamente non disponibile",
+   "🎬 Фільм і 👕 речі: тимчасово недоступно", "🎬 Фильм и 👕 вещи: временно недоступно")
+_L("🎬 Movie & 👕 items: nothing identifiable", "🎬 Película y 👕 objetos: nada identificable",
+   "🎬 Filme e 👕 itens: nada identificável", "🎬 Film & 👕 Sachen: nichts Erkennbares",
+   "🎬 Film & 👕 objets : rien d'identifiable", "🎬 Film e 👕 oggetti: niente di riconoscibile",
+   "🎬 Фільм і 👕 речі: нічого не знайдено", "🎬 Фильм и 👕 вещи: ничего не найдено")
+_L("🎵 Song: no sound in this media", "🎵 Canción: este archivo no tiene sonido", "🎵 Música: sem som nesta mídia",
+   "🎵 Song: kein Ton vorhanden", "🎵 Chanson : pas de son", "🎵 Canzone: nessun audio", "🎵 Пісня: немає звуку",
+   "🎵 Песня: нет звука")
+_L("💳 Credits left: {n}", "💳 Créditos restantes: {n}", "💳 Créditos restantes: {n}", "💳 Credits übrig: {n}",
+   "💳 Crédits restants : {n}", "💳 Crediti rimasti: {n}", "💳 Залишилось кредитів: {n}",
+   "💳 Осталось кредитов: {n}")
+_L("⭐ Unlimited until {date}", "⭐ Ilimitado hasta {date}", "⭐ Ilimitado até {date}", "⭐ Unlimited bis {date}",
+   "⭐ Illimité jusqu'au {date}", "⭐ Illimitato fino al {date}", "⭐ Безліміт до {date}", "⭐ Безлимит до {date}")
+_L("Want something else from this Reel? 👇", "¿Quieres buscar algo más en este Reel? 👇",
+   "Quer achar mais alguma coisa neste Reel? 👇", "Noch was anderes aus diesem Reel? 👇",
+   "Autre chose à trouver dans ce Reel ? 👇", "Vuoi trovare altro in questo Reel? 👇",
+   "Знайти ще щось у цьому Reels? 👇", "Найти ещё что-то в этом Reels? 👇")
+_L("Oops, I couldn't save that one 😕 Please send it again in a moment.",
+   "Uy, no pude guardarlo 😕 Mándalo de nuevo en un momento.", "Ops, não consegui salvar 😕 Mande de novo daqui a pouco.",
+   "Ups, das konnte ich nicht speichern 😕 Schick es gleich nochmal.",
+   "Oups, je n'ai pas pu l'enregistrer 😕 Renvoie-le dans un instant.", "Ops, non sono riuscito a salvarlo 😕 Rimandalo tra poco.",
+   "Ой, не вдалося зберегти 😕 Надішли ще раз за мить.", "Ой, не получилось сохранить 😕 Пришли ещё раз через минутку.")
+_L("🎁 Code applied: +{credits} credits!\n💳 Credits left: {balance}\n\nSend me a Reel to use them 👇",
+   "🎁 ¡Código aplicado: +{credits} créditos!\n💳 Créditos restantes: {balance}\n\nMándame un Reel para usarlos 👇",
+   "🎁 Código aplicado: +{credits} créditos!\n💳 Créditos restantes: {balance}\n\nMande um Reel para usar 👇",
+   "🎁 Code eingelöst: +{credits} Credits!\n💳 Credits übrig: {balance}\n\nSchick mir ein Reel, um sie zu nutzen 👇",
+   "🎁 Code appliqué : +{credits} crédits !\n💳 Crédits restants : {balance}\n\nEnvoie-moi un Reel pour les utiliser 👇",
+   "🎁 Codice applicato: +{credits} crediti!\n💳 Crediti rimasti: {balance}\n\nMandami un Reel per usarli 👇",
+   "🎁 Код активовано: +{credits} кредитів!\n💳 Залишилось кредитів: {balance}\n\nНадішли Reels, щоб їх використати 👇",
+   "🎁 Код активирован: +{credits} кредитов!\n💳 Осталось кредитов: {balance}\n\nПришли Reels, чтобы их потратить 👇")
+_L("You've already used this code 🙂", "Ya usaste este código 🙂", "Você já usou este código 🙂",
+   "Diesen Code hast du schon benutzt 🙂", "Tu as déjà utilisé ce code 🙂", "Hai già usato questo codice 🙂",
+   "Ти вже використав цей код 🙂", "Ты уже использовал этот код 🙂")
+_L("This code has expired or run out 😕", "Este código caducó o se agotó 😕", "Este código expirou ou esgotou 😕",
+   "Dieser Code ist abgelaufen oder aufgebraucht 😕", "Ce code a expiré ou est épuisé 😕",
+   "Questo codice è scaduto o esaurito 😕", "Цей код закінчився або вичерпаний 😕", "Этот код истёк или закончился 😕")
+_L("Hey there! 👋 I'm {bot_name}.\n\nSend me any Reel (tap ✈️ under the Reel → send it to me), a video or a photo, "
+   "and in a few seconds I'll find:\n🎵 the song\n🎬 the movie or TV show\n👕 the outfit & items\n📍 the place\n\n{balance}",
+   "¡Hola! 👋 Soy {bot_name}.\n\nMándame cualquier Reel (toca ✈️ debajo del Reel → envíamelo), un video o una foto, "
+   "y en segundos encontraré:\n🎵 la canción\n🎬 la película o serie\n👕 la ropa y los objetos\n📍 el lugar\n\n{balance}",
+   "Oi! 👋 Eu sou o {bot_name}.\n\nMande qualquer Reel (toque em ✈️ embaixo do Reel → envie pra mim), um vídeo ou "
+   "uma foto, e em segundos eu acho:\n🎵 a música\n🎬 o filme ou série\n👕 a roupa e os itens\n📍 o lugar\n\n{balance}",
+   "Hey! 👋 Ich bin {bot_name}.\n\nSchick mir ein Reel (✈️ unter dem Reel → an mich senden), ein Video oder ein Foto, "
+   "und in Sekunden finde ich:\n🎵 den Song\n🎬 den Film oder die Serie\n👕 das Outfit & die Sachen\n📍 den Ort\n\n{balance}",
+   "Salut ! 👋 Je suis {bot_name}.\n\nEnvoie-moi un Reel (✈️ sous le Reel → envoie-le-moi), une vidéo ou une photo, "
+   "et en quelques secondes je trouve :\n🎵 la chanson\n🎬 le film ou la série\n👕 la tenue et les objets\n📍 le lieu\n\n{balance}",
+   "Ciao! 👋 Sono {bot_name}.\n\nMandami un Reel (tocca ✈️ sotto il Reel → inviamelo), un video o una foto, "
+   "e in pochi secondi trovo:\n🎵 la canzone\n🎬 il film o la serie\n👕 l'outfit e gli oggetti\n📍 il luogo\n\n{balance}",
+   "Привіт! 👋 Я {bot_name}.\n\nНадішли мені будь-який Reels (✈️ під Reels → мені), відео або фото, "
+   "і за кілька секунд я знайду:\n🎵 пісню\n🎬 фільм або серіал\n👕 одяг і речі\n📍 місце\n\n{balance}",
+   "Привет! 👋 Я {bot_name}.\n\nПришли мне любой Reels (✈️ под Reels → мне), видео или фото, "
+   "и за пару секунд я найду:\n🎵 песню\n🎬 фильм или сериал\n👕 одежду и вещи\n📍 место\n\n{balance}")
+
+_L("📍 Find Place", "📍 Buscar lugar", "📍 Achar lugar", "📍 Ort finden", "📍 Le lieu", "📍 Trova luogo",
+   "📍 Знайти місце", "📍 Найти место")
+_L("📚 My lists", "📚 Mis listas", "📚 Minhas listas", "📚 Meine Listen", "📚 Mes listes", "📚 Le mie liste",
+   "📚 Мої списки", "📚 Мои списки")
+_L("🎁 Invite friends", "🎁 Invitar amigos", "🎁 Convidar amigos", "🎁 Freunde einladen", "🎁 Inviter des amis",
+   "🎁 Invita amici", "🎁 Запросити друзів", "🎁 Пригласить друзей")
+_L("📍 Place found!", "📍 ¡Lugar encontrado!", "📍 Lugar encontrado!", "📍 Ort gefunden!", "📍 Lieu trouvé !",
+   "📍 Luogo trovato!", "📍 Місце знайдено!", "📍 Место найдено!")
+_L("🔎 Photos & info", "🔎 Fotos e info", "🔎 Fotos e info", "🔎 Fotos & Infos", "🔎 Photos & infos",
+   "🔎 Foto e info", "🔎 Фото та інфо", "🔎 Фото и инфо")
+_L("🎬 Movie, 👕 items & 📍 place: temporarily unavailable", "🎬 Película, 👕 objetos y 📍 lugar: no disponible por ahora",
+   "🎬 Filme, 👕 itens e 📍 lugar: indisponível no momento", "🎬 Film, 👕 Sachen & 📍 Ort: gerade nicht verfügbar",
+   "🎬 Film, 👕 objets & 📍 lieu : indisponible pour l'instant", "🎬 Film, 👕 oggetti e 📍 luogo: momentaneamente non disponibile",
+   "🎬 Фільм, 👕 речі та 📍 місце: тимчасово недоступно", "🎬 Фильм, 👕 вещи и 📍 место: временно недоступно")
+_L("🎬 Movie, 👕 items & 📍 place: nothing identifiable", "🎬 Película, 👕 objetos y 📍 lugar: nada identificable",
+   "🎬 Filme, 👕 itens e 📍 lugar: nada identificável", "🎬 Film, 👕 Sachen & 📍 Ort: nichts Erkennbares",
+   "🎬 Film, 👕 objets & 📍 lieu : rien d'identifiable", "🎬 Film, 👕 oggetti e 📍 luogo: niente di riconoscibile",
+   "🎬 Фільм, 👕 речі та 📍 місце: нічого не знайдено", "🎬 Фильм, 👕 вещи и 📍 место: ничего не найдено")
+_L("🎁 Invite friends and get +{n} free searches for each friend who joins — your friend gets +{n} too!\nJust forward them the next message 👇",
+   "🎁 Invita a tus amigos y gana +{n} búsquedas gratis por cada amigo que se una. ¡Tu amigo también recibe +{n}!\nSolo reenvíale el siguiente mensaje 👇",
+   "🎁 Convide amigos e ganhe +{n} buscas grátis por cada amigo que entrar — seu amigo também ganha +{n}!\nÉ só encaminhar a próxima mensagem 👇",
+   "🎁 Lade Freunde ein und bekomm +{n} Gratis-Suchen für jeden Freund, der mitmacht – dein Freund bekommt auch +{n}!\nLeite ihm einfach die nächste Nachricht weiter 👇",
+   "🎁 Invite tes amis et gagne +{n} recherches gratuites pour chaque ami qui rejoint — ton ami reçoit aussi +{n} !\nTransfère-lui simplement le message suivant 👇",
+   "🎁 Invita gli amici e ottieni +{n} ricerche gratis per ogni amico che si unisce: anche il tuo amico riceve +{n}!\nInoltragli il prossimo messaggio 👇",
+   "🎁 Запрошуй друзів і отримуй +{n} безкоштовних пошуків за кожного, хто приєднається — друг теж отримає +{n}!\nПросто перешли йому наступне повідомлення 👇",
+   "🎁 Приглашай друзей и получай +{n} бесплатных поисков за каждого, кто присоединится — друг тоже получит +{n}!\nПросто перешли ему следующее сообщение 👇")
+_L("🔥 This bot finds the song, movie, outfit & place from any Instagram Reel — right in DM!\n\n1️⃣ Open {link}\n2️⃣ Send it this code: {code}\n\nWe both get +{n} free searches 🎁",
+   "🔥 Este bot encuentra la canción, la película, la ropa y el lugar de cualquier Reel de Instagram, ¡directo en DM!\n\n1️⃣ Abre {link}\n2️⃣ Envíale este código: {code}\n\nLos dos recibimos +{n} búsquedas gratis 🎁",
+   "🔥 Esse bot acha a música, o filme, a roupa e o lugar de qualquer Reel do Instagram — direto na DM!\n\n1️⃣ Abra {link}\n2️⃣ Mande este código: {code}\n\nNós dois ganhamos +{n} buscas grátis 🎁",
+   "🔥 Dieser Bot findet Song, Film, Outfit & Ort aus jedem Instagram-Reel – direkt per DM!\n\n1️⃣ Öffne {link}\n2️⃣ Schick ihm diesen Code: {code}\n\nWir beide bekommen +{n} Gratis-Suchen 🎁",
+   "🔥 Ce bot trouve la chanson, le film, la tenue et le lieu de n'importe quel Reel Instagram, directement en DM !\n\n1️⃣ Ouvre {link}\n2️⃣ Envoie-lui ce code : {code}\n\nOn reçoit tous les deux +{n} recherches gratuites 🎁",
+   "🔥 Questo bot trova la canzone, il film, l'outfit e il luogo di qualsiasi Reel di Instagram, direttamente in DM!\n\n1️⃣ Apri {link}\n2️⃣ Mandagli questo codice: {code}\n\nRiceviamo entrambi +{n} ricerche gratis 🎁",
+   "🔥 Цей бот знаходить пісню, фільм, одяг і місце з будь-якого Reels в Instagram — прямо в директі!\n\n1️⃣ Відкрий {link}\n2️⃣ Надішли йому код: {code}\n\nМи обидва отримаємо +{n} безкоштовних пошуків 🎁",
+   "🔥 Этот бот находит песню, фильм, одежду и место из любого Reels в Instagram — прямо в директе!\n\n1️⃣ Открой {link}\n2️⃣ Отправь ему код: {code}\n\nМы оба получим +{n} бесплатных поисков 🎁")
+_L("🔋 That was your last free search.", "🔋 Esa fue tu última búsqueda gratis.", "🔋 Essa foi sua última busca grátis.",
+   "🔋 Das war deine letzte Gratis-Suche.", "🔋 C'était ta dernière recherche gratuite.", "🔋 Era la tua ultima ricerca gratuita.",
+   "🔋 Це був твій останній безкоштовний пошук.", "🔋 Это был твой последний бесплатный поиск.")
+_L("🎁 Invite code accepted: +{credits} credits!\n💳 Credits left: {balance}\n\nSend me a Reel 👇",
+   "🎁 ¡Código de invitación aceptado: +{credits} créditos!\n💳 Créditos restantes: {balance}\n\nMándame un Reel 👇",
+   "🎁 Código de convite aceito: +{credits} créditos!\n💳 Créditos restantes: {balance}\n\nMande um Reel 👇",
+   "🎁 Einladungscode angenommen: +{credits} Credits!\n💳 Credits übrig: {balance}\n\nSchick mir ein Reel 👇",
+   "🎁 Code d'invitation accepté : +{credits} crédits !\n💳 Crédits restants : {balance}\n\nEnvoie-moi un Reel 👇",
+   "🎁 Codice invito accettato: +{credits} crediti!\n💳 Crediti rimasti: {balance}\n\nMandami un Reel 👇",
+   "🎁 Код запрошення прийнято: +{credits} кредитів!\n💳 Залишилось кредитів: {balance}\n\nНадішли Reels 👇",
+   "🎁 Код приглашения принят: +{credits} кредитов!\n💳 Осталось кредитов: {balance}\n\nПришли Reels 👇")
+_L("🎉 A friend joined with your invite code! +{credits} credits\n💳 Credits left: {balance}",
+   "🎉 ¡Un amigo se unió con tu código! +{credits} créditos\n💳 Créditos restantes: {balance}",
+   "🎉 Um amigo entrou com seu código! +{credits} créditos\n💳 Créditos restantes: {balance}",
+   "🎉 Ein Freund ist mit deinem Code dabei! +{credits} Credits\n💳 Credits übrig: {balance}",
+   "🎉 Un ami a rejoint avec ton code ! +{credits} crédits\n💳 Crédits restants : {balance}",
+   "🎉 Un amico si è unito con il tuo codice! +{credits} crediti\n💳 Crediti rimasti: {balance}",
+   "🎉 Друг приєднався за твоїм кодом! +{credits} кредитів\n💳 Залишилось кредитів: {balance}",
+   "🎉 Друг присоединился по твоему коду! +{credits} кредитов\n💳 Осталось кредитов: {balance}")
+_L("That's your own invite code 😄 Share it with friends!", "Ese es tu propio código 😄 ¡Compártelo con tus amigos!",
+   "Esse é o seu próprio código 😄 Compartilhe com os amigos!", "Das ist dein eigener Code 😄 Teil ihn mit Freunden!",
+   "C'est ton propre code 😄 Partage-le avec tes amis !", "Questo è il tuo codice 😄 Condividilo con gli amici!",
+   "Це твій власний код 😄 Поділися ним із друзями!", "Это твой собственный код 😄 Поделись им с друзьями!")
+_L("You've already used an invite code 🙂", "Ya usaste un código de invitación 🙂", "Você já usou um código de convite 🙂",
+   "Du hast schon einen Einladungscode benutzt 🙂", "Tu as déjà utilisé un code d'invitation 🙂", "Hai già usato un codice invito 🙂",
+   "Ти вже використав код запрошення 🙂", "Ты уже использовал код приглашения 🙂")
+_L("Invite codes are only for new users 🙂", "Los códigos de invitación son solo para usuarios nuevos 🙂",
+   "Códigos de convite são só para novos usuários 🙂", "Einladungscodes gibt's nur für neue Nutzer 🙂",
+   "Les codes d'invitation sont réservés aux nouveaux utilisateurs 🙂", "I codici invito sono solo per i nuovi utenti 🙂",
+   "Коди запрошення лише для нових користувачів 🙂", "Коды приглашения только для новых пользователей 🙂")
+_L("This invite code has reached today's limit — try again tomorrow 🙂", "Este código alcanzó el límite de hoy, inténtalo mañana 🙂",
+   "Este código atingiu o limite de hoje — tente amanhã 🙂", "Dieser Code hat das Tageslimit erreicht – versuch es morgen nochmal 🙂",
+   "Ce code a atteint la limite du jour — réessaie demain 🙂", "Questo codice ha raggiunto il limite di oggi: riprova domani 🙂",
+   "Цей код вичерпав ліміт на сьогодні — спробуй завтра 🙂", "Этот код исчерпал лимит на сегодня — попробуй завтра 🙂")
+_L("📚 Your lists — what should I show?", "📚 Tus listas: ¿qué te muestro?", "📚 Suas listas — o que eu mostro?",
+   "📚 Deine Listen – was soll ich zeigen?", "📚 Tes listes — qu'est-ce que je t'affiche ?", "📚 Le tue liste: cosa ti mostro?",
+   "📚 Твої списки — що показати?", "📚 Твои списки — что показать?")
+_L("📚 Your lists are empty for now — every song, movie, item and place I find for you is saved here automatically.",
+   "📚 Tus listas están vacías por ahora: cada canción, película, objeto y lugar que encuentre se guardará aquí automáticamente.",
+   "📚 Suas listas estão vazias por enquanto — cada música, filme, item e lugar que eu achar fica salvo aqui automaticamente.",
+   "📚 Deine Listen sind noch leer – jeder Song, Film, jede Sache und jeder Ort, den ich finde, landet automatisch hier.",
+   "📚 Tes listes sont vides pour l'instant — chaque chanson, film, objet et lieu que je trouve y est enregistré automatiquement.",
+   "📚 Le tue liste sono vuote per ora: ogni canzone, film, oggetto e luogo che trovo viene salvato qui automaticamente.",
+   "📚 Твої списки поки порожні — кожна пісня, фільм, річ і місце, які я знайду, зберігаються тут автоматично.",
+   "📚 Твои списки пока пусты — каждая песня, фильм, вещь и место, которые я найду, сохраняются здесь автоматически.")
+_L("🎵 Songs ({n})", "🎵 Canciones ({n})", "🎵 Músicas ({n})", "🎵 Songs ({n})", "🎵 Chansons ({n})", "🎵 Canzoni ({n})",
+   "🎵 Пісні ({n})", "🎵 Песни ({n})")
+_L("🎬 Movies ({n})", "🎬 Películas ({n})", "🎬 Filmes ({n})", "🎬 Filme ({n})", "🎬 Films ({n})", "🎬 Film ({n})",
+   "🎬 Фільми ({n})", "🎬 Фильмы ({n})")
+_L("👕 Items ({n})", "👕 Objetos ({n})", "👕 Itens ({n})", "👕 Sachen ({n})", "👕 Objets ({n})", "👕 Oggetti ({n})",
+   "👕 Речі ({n})", "👕 Вещи ({n})")
+_L("📍 Places ({n})", "📍 Lugares ({n})", "📍 Lugares ({n})", "📍 Orte ({n})", "📍 Lieux ({n})", "📍 Luoghi ({n})",
+   "📍 Місця ({n})", "📍 Места ({n})")
+_L("🎵 Your songs ({n}):", "🎵 Tus canciones ({n}):", "🎵 Suas músicas ({n}):", "🎵 Deine Songs ({n}):",
+   "🎵 Tes chansons ({n}) :", "🎵 Le tue canzoni ({n}):", "🎵 Твої пісні ({n}):", "🎵 Твои песни ({n}):")
+_L("🎬 Your movies & shows ({n}):", "🎬 Tus películas y series ({n}):", "🎬 Seus filmes e séries ({n}):",
+   "🎬 Deine Filme & Serien ({n}):", "🎬 Tes films & séries ({n}) :", "🎬 I tuoi film e serie ({n}):",
+   "🎬 Твої фільми та серіали ({n}):", "🎬 Твои фильмы и сериалы ({n}):")
+_L("👕 Your items ({n}):", "👕 Tus objetos ({n}):", "👕 Seus itens ({n}):", "👕 Deine Sachen ({n}):",
+   "👕 Tes objets ({n}) :", "👕 I tuoi oggetti ({n}):", "👕 Твої речі ({n}):", "👕 Твои вещи ({n}):")
+_L("📍 Your places ({n}):", "📍 Tus lugares ({n}):", "📍 Seus lugares ({n}):", "📍 Deine Orte ({n}):",
+   "📍 Tes lieux ({n}) :", "📍 I tuoi luoghi ({n}):", "📍 Твої місця ({n}):", "📍 Твои места ({n}):")
+_L("🔗 Open", "🔗 Abrir", "🔗 Abrir", "🔗 Öffnen", "🔗 Ouvrir", "🔗 Apri", "🔗 Відкрити", "🔗 Открыть")
+_L("👋 DM me any Reel — I find songs, movies, outfits & places!",
+   "👋 Mándame cualquier Reel por DM: encuentro canciones, películas, ropa y lugares.",
+   "👋 Me mande qualquer Reel na DM — eu acho músicas, filmes, roupas e lugares!",
+   "👋 Schick mir ein Reel per DM – ich finde Songs, Filme, Outfits & Orte!",
+   "👋 Envoie-moi n'importe quel Reel en DM — je trouve chansons, films, tenues et lieux !",
+   "👋 Mandami un Reel in DM: trovo canzoni, film, outfit e luoghi!",
+   "👋 Надішли мені будь-який Reels у директ — знаходжу пісні, фільми, одяг і місця!",
+   "👋 Пришли мне любой Reels в директ — нахожу песни, фильмы, одежду и места!")
+
+# Typed commands in every language (Quick Replies aren't shown on Instagram desktop)
+LOCAL_TEXT_COMMANDS = {
+    "canción": "FIND_MUSIC", "cancion": "FIND_MUSIC", "música": "FIND_MUSIC", "musica": "FIND_MUSIC",
+    "canzone": "FIND_MUSIC", "chanson": "FIND_MUSIC", "musique": "FIND_MUSIC", "lied": "FIND_MUSIC",
+    "пісня": "FIND_MUSIC", "песня": "FIND_MUSIC", "музыка": "FIND_MUSIC", "музика": "FIND_MUSIC",
+    "película": "FIND_MOVIE", "pelicula": "FIND_MOVIE", "filme": "FIND_MOVIE", "série": "FIND_MOVIE",
+    "serie": "FIND_MOVIE", "фільм": "FIND_MOVIE", "фильм": "FIND_MOVIE", "серіал": "FIND_MOVIE",
+    "сериал": "FIND_MOVIE",
+    "ropa": "FIND_ITEM", "roupa": "FIND_ITEM", "tenue": "FIND_ITEM", "vêtements": "FIND_ITEM",
+    "kleidung": "FIND_ITEM", "vestiti": "FIND_ITEM", "одяг": "FIND_ITEM", "одежда": "FIND_ITEM",
+    "речі": "FIND_ITEM", "вещи": "FIND_ITEM",
+    "todo": "FIND_ALL", "tudo": "FIND_ALL", "alles": "FIND_ALL", "tout": "FIND_ALL", "tutto": "FIND_ALL",
+    "все": "FIND_ALL", "всё": "FIND_ALL",
+}
+LOCAL_BALANCE_COMMANDS = {"saldo", "créditos", "creditos", "guthaben", "solde", "crédits", "crediti",
+                          "баланс", "кредити", "кредиты"}
+
 
 QUICK_REPLIES = [
     {"content_type": "text", "title": "🎵 Find Song", "payload": FIND_MUSIC},
     {"content_type": "text", "title": "🎬 Find Movie", "payload": FIND_MOVIE},
     {"content_type": "text", "title": "👕 Find Outfit/Item", "payload": FIND_ITEM},
+    {"content_type": "text", "title": "📍 Find Place", "payload": FIND_PLACE},
     {"content_type": "text", "title": "🔥 Find Everything", "payload": FIND_ALL},
+    {"content_type": "text", "title": "📚 My lists", "payload": MY_LISTS},
 ]
 
 # Typed fallbacks (Quick Replies are not rendered on Instagram desktop).
@@ -225,9 +535,51 @@ TEXT_COMMANDS = {
     "outfit": FIND_ITEM, "item": FIND_ITEM, "items": FIND_ITEM, "clothes": FIND_ITEM,
     "find outfit": FIND_ITEM, "find item": FIND_ITEM,
     "all": FIND_ALL, "everything": FIND_ALL, "find everything": FIND_ALL,
+    "place": FIND_PLACE, "location": FIND_PLACE, "where": FIND_PLACE, "find place": FIND_PLACE,
+    "lugar": FIND_PLACE, "local": FIND_PLACE, "ort": FIND_PLACE, "lieu": FIND_PLACE, "luogo": FIND_PLACE,
+    "місце": FIND_PLACE, "место": FIND_PLACE, "где": FIND_PLACE, "де": FIND_PLACE,
 }
+# @mention in a comment → what to look for, and in which language to answer
+MENTION_WORDS: dict[str, tuple[str, str]] = {}
+for _lang, _action, _words in (
+    ("en", FIND_MUSIC, "song music track sound audio beat 🎵 🎶"),
+    ("en", FIND_MOVIE, "movie film show series 🎬"),
+    ("en", FIND_ITEM, "outfit fit wearing wear shoes sneakers jacket hoodie dress bag glasses 👕 👟"),
+    ("en", FIND_PLACE, "where place location spot 📍"),
+    ("es", FIND_MUSIC, "canción cancion música musica"), ("es", FIND_MOVIE, "película pelicula serie"),
+    ("es", FIND_ITEM, "ropa zapatillas chaqueta"), ("es", FIND_PLACE, "dónde donde lugar"),
+    ("pt", FIND_MUSIC, "música som"), ("pt", FIND_MOVIE, "filme"), ("pt", FIND_ITEM, "roupa tênis"),
+    ("pt", FIND_PLACE, "onde"),
+    ("de", FIND_MUSIC, "lied welcher"), ("de", FIND_ITEM, "kleidung jacke schuhe"), ("de", FIND_PLACE, "wo ort"),
+    ("fr", FIND_MUSIC, "chanson musique"), ("fr", FIND_ITEM, "tenue vêtements"), ("fr", FIND_PLACE, "où lieu"),
+    ("it", FIND_MUSIC, "canzone"), ("it", FIND_ITEM, "vestiti scarpe"), ("it", FIND_PLACE, "dove luogo"),
+    ("uk", FIND_MUSIC, "пісня пісню музика"), ("uk", FIND_MOVIE, "фільм серіал"), ("uk", FIND_ITEM, "одяг кросівки"),
+    ("uk", FIND_PLACE, "де місце"),
+    ("ru", FIND_MUSIC, "песня песню музыка трек"), ("ru", FIND_MOVIE, "фильм сериал"),
+    ("ru", FIND_ITEM, "одежда кроссовки куртка"), ("ru", FIND_PLACE, "где место"),
+):
+    for _w in _words.split():
+        MENTION_WORDS.setdefault(_w, (_action, _lang))
+
+
+def mention_intent(text: str) -> tuple[str, str]:
+    """('FIND_*', lang) from a comment like '@bot what song is this?'. Default: song, English."""
+    words = re.findall(r"[\w']+|[\U0001F300-\U0001FAFF]", text.lower())
+    for w in words:
+        if w in MENTION_WORDS:
+            return MENTION_WORDS[w]
+    return FIND_MUSIC, "en"
+
+
+LIST_COMMANDS = {"list", "lists", "my list", "my lists", "collection", "my finds", "history", "listas",
+                 "mis listas", "minhas listas", "listen", "meine listen", "liste", "listes", "mes listes",
+                 "le mie liste", "список", "списки", "мои списки", "мої списки", "колекція", "коллекция"}
+INVITE_COMMANDS = {"invite", "invite friends", "referral", "friends", "refer", "invitar", "convidar",
+                   "einladen", "inviter", "invita", "invitare", "пригласить", "запросити", "друзья", "друзі"}
 BALANCE_COMMANDS = {"balance", "credits", "status", "my credits"}
 BUY_COMMANDS = {"buy", "upgrade", "pricing", "premium", "subscribe", "pay"}
+TEXT_COMMANDS.update(LOCAL_TEXT_COMMANDS)
+BALANCE_COMMANDS |= LOCAL_BALANCE_COMMANDS
 PROMO_RE = re.compile(r"[A-Z0-9][A-Z0-9_-]{2,23}")
 DELETE_COMMANDS = {"delete my data", "delete data", "delete my account", "remove my data"}
 MSG_DATA_DELETED = (
@@ -266,7 +618,8 @@ MSG_NOT_FOUND = {
     FIND_MUSIC: "😕 I couldn't recognise the song in this clip — it may be an original sound, a voice-over or a heavy remix.\nNo credit was used.",
     FIND_MOVIE: "😕 I couldn't confidently identify a movie or TV show here — it may be original content.\nNo credit was used.",
     FIND_ITEM: "😕 I couldn't spot any identifiable clothes or items here.\nNo credit was used.",
-    FIND_ALL: "😕 I couldn't find a song, a movie/show or identifiable items in this one.\nNo credits were used.",
+    FIND_ALL: "😕 I couldn't find a song, a movie/show, identifiable items or a place in this one.\nNo credits were used.",
+    FIND_PLACE: "😕 I couldn't recognise where this was filmed — it may be an ordinary street or an indoor place.\nNo credit was used.",
 }
 MSG_PAYMENTS_SOON = (
     "You've used all your free searches 🔋\n"
@@ -276,14 +629,198 @@ MSG_PAYMENT_CREDITS = "✅ Payment received — thank you! +{n} credits added.\n
 MSG_PAYMENT_SUB = "✅ Unlimited is active until {date}! 🔥\nSend me any Reel — every search is on us now."
 
 
+# ---- translations of the messages above (order: es, pt, de, fr, it, uk, ru)
+_L(MSG_MENU,
+   "¡Listo! 🔥 ¿Qué busco en este?\n(¿En el ordenador? Responde: canción, película, ropa o todo)",
+   "Beleza! 🔥 O que eu procuro neste?\n(No computador? Responda: música, filme, roupa ou tudo)",
+   "Hab's! 🔥 Was soll ich hier finden?\n(Am Computer? Antworte einfach: song, film, kleidung oder alles)",
+   "Reçu ! 🔥 Qu'est-ce que je cherche dans celui-ci ?\n(Sur ordinateur ? Réponds : chanson, film, tenue ou tout)",
+   "Ricevuto! 🔥 Cosa cerco in questo?\n(Da computer? Rispondi: canzone, film, vestiti o tutto)",
+   "Є! 🔥 Що шукаємо в цьому?\n(З комп'ютера? Просто напиши: пісня, фільм, одяг або все)",
+   "Есть! 🔥 Что ищем в этом?\n(С компьютера? Просто напиши: песня, фильм, одежда или всё)")
+_L(MSG_NO_MEDIA,
+   "Primero mándame un Reel, video o foto 🙂\nToca ✈️ debajo de cualquier Reel → envíamelo.",
+   "Primeiro me mande um Reel, vídeo ou foto 🙂\nToque em ✈️ embaixo de qualquer Reel → envie pra mim.",
+   "Schick mir zuerst ein Reel, Video oder Foto 🙂\nTippe unter einem Reel auf ✈️ → schick es mir.",
+   "Envoie-moi d'abord un Reel, une vidéo ou une photo 🙂\nAppuie sur ✈️ sous un Reel → envoie-le-moi.",
+   "Prima mandami un Reel, un video o una foto 🙂\nTocca ✈️ sotto un Reel → inviamelo.",
+   "Спершу надішли мені Reels, відео або фото 🙂\nНатисни ✈️ під будь-яким Reels → надішли мені.",
+   "Сначала пришли мне Reels, видео или фото 🙂\nНажми ✈️ под любым Reels → отправь мне.")
+_L(MSG_LINK_UNSUPPORTED,
+   "Todavía no puedo abrir enlaces de TikTok / YouTube 🙈\nMándame un Reel de Instagram (toca ✈️ debajo → envíamelo) o el archivo de video.",
+   "Ainda não consigo abrir links do TikTok / YouTube 🙈\nMande um Reel do Instagram (toque em ✈️ embaixo → envie pra mim) ou o próprio arquivo de vídeo.",
+   "TikTok- / YouTube-Links kann ich noch nicht öffnen 🙈\nSchick mir ein Instagram-Reel (✈️ darunter → an mich senden) oder die Videodatei.",
+   "Je ne peux pas encore ouvrir les liens TikTok / YouTube 🙈\nEnvoie-moi un Reel Instagram (✈️ dessous → envoie-le-moi) ou le fichier vidéo.",
+   "Non posso ancora aprire link di TikTok / YouTube 🙈\nMandami un Reel di Instagram (tocca ✈️ sotto → inviamelo) o il file video.",
+   "Посилання TikTok / YouTube я поки не відкриваю 🙈\nНадішли Reels з Instagram (✈️ під ним → мені) або сам відеофайл.",
+   "Ссылки TikTok / YouTube я пока не открываю 🙈\nПришли Reels из Instagram (✈️ под ним → мне) или сам видеофайл.")
+_L(MSG_REEL_BLOCKED,
+   "Instagram no me dejó abrir este Reel ahora 😕 (puede ser privado o restringido).\nSolución rápida: graba la pantalla con sonido (o guarda el video) y mándame el archivo. Para película/ropa también sirve una captura.\nNo se gastó ningún crédito.",
+   "O Instagram não me deixou abrir este Reel agora 😕 (pode ser privado ou restrito).\nDica: grave a tela com som (ou salve o vídeo) e me mande o arquivo. Para filme/roupa, um print também serve.\nNenhum crédito foi usado.",
+   "Instagram lässt mich dieses Reel gerade nicht öffnen 😕 (evtl. privat oder eingeschränkt).\nSchnelle Lösung: Bildschirm mit Ton aufnehmen (oder Video speichern) und mir die Datei schicken. Für Film/Outfit reicht auch ein Screenshot.\nEs wurde kein Credit verbraucht.",
+   "Instagram ne m'a pas laissé ouvrir ce Reel pour l'instant 😕 (il est peut-être privé ou restreint).\nAstuce : fais un enregistrement d'écran avec le son (ou enregistre la vidéo) et envoie-moi le fichier. Pour film/tenue, une capture d'écran suffit.\nAucun crédit utilisé.",
+   "Instagram non mi ha fatto aprire questo Reel ora 😕 (potrebbe essere privato o limitato).\nSoluzione veloce: registra lo schermo con l'audio (o salva il video) e mandami il file. Per film/outfit va bene anche uno screenshot.\nNessun credito usato.",
+   "Instagram зараз не дав відкрити цей Reels 😕 (можливо, він приватний або обмежений).\nШвидке рішення: запиши екран зі звуком (або збережи відео) і надішли мені файл. Для пошуку фільму/одягу підійде і скриншот.\nКредит не списано.",
+   "Instagram сейчас не дал открыть этот Reels 😕 (возможно, он закрытый или с ограничениями).\nБыстрое решение: запиши экран со звуком (или сохрани видео) и пришли мне файл. Для поиска фильма/одежды подойдёт и скриншот.\nКредит не списан.")
+_L(MSG_MEDIA_RESTRICTED,
+   "No pude acceder a este Reel 😕 Puede ser de una cuenta privada o estar restringido por el autor.\nPrueba otro Reel o mándame el archivo de video / una captura.",
+   "Não consegui acessar este Reel 😕 Pode ser de uma conta privada ou restrito pelo autor.\nTente outro Reel ou mande o arquivo de vídeo / um print.",
+   "Ich komme an dieses Reel nicht ran 😕 Es ist evtl. von einem privaten Konto oder vom Autor eingeschränkt.\nProbier ein anderes Reel oder schick die Videodatei / einen Screenshot.",
+   "Je n'ai pas pu accéder à ce Reel 😕 Il vient peut-être d'un compte privé ou est restreint par l'auteur.\nEssaie un autre Reel, ou envoie le fichier vidéo / une capture d'écran.",
+   "Non riesco ad accedere a questo Reel 😕 Potrebbe essere di un account privato o limitato dall'autore.\nProva un altro Reel o mandami il file video / uno screenshot.",
+   "Не вдалося відкрити цей Reels 😕 Можливо, він із приватного акаунта або автор обмежив доступ.\nСпробуй інший Reels або надішли відеофайл / скриншот.",
+   "Не получилось открыть этот Reels 😕 Возможно, он из закрытого аккаунта или автор ограничил доступ.\nПопробуй другой Reels или пришли видеофайл / скриншот.")
+_L(MSG_EXPIRED,
+   "Este archivo ya no está disponible (los enlaces de Instagram caducan). Comparte el Reel de nuevo 🙏 No se gastó ningún crédito.",
+   "Esta mídia não está mais disponível (os links do Instagram expiram). Compartilhe o Reel de novo 🙏 Nenhum crédito foi usado.",
+   "Dieses Medium ist nicht mehr verfügbar (Instagram-Links laufen ab). Teile das Reel bitte nochmal 🙏 Es wurde kein Credit verbraucht.",
+   "Ce média n'est plus disponible (les liens Instagram expirent). Partage le Reel à nouveau 🙏 Aucun crédit utilisé.",
+   "Questo contenuto non è più disponibile (i link di Instagram scadono). Condividi di nuovo il Reel 🙏 Nessun credito usato.",
+   "Цей файл уже недоступний (посилання Instagram з часом зникають). Надішли Reels ще раз 🙏 Кредит не списано.",
+   "Этот файл уже недоступен (ссылки Instagram со временем истекают). Пришли Reels ещё раз 🙏 Кредит не списан.")
+_L(MSG_DOWNLOAD_FAILED,
+   "No pude descargar este archivo 😕 Compártelo de nuevo. No se gastó ningún crédito.",
+   "Não consegui baixar esta mídia 😕 Compartilhe de novo. Nenhum crédito foi usado.",
+   "Ich konnte das nicht herunterladen 😕 Teile es bitte nochmal. Es wurde kein Credit verbraucht.",
+   "Je n'ai pas pu télécharger ce média 😕 Partage-le à nouveau. Aucun crédit utilisé.",
+   "Non sono riuscito a scaricarlo 😕 Condividilo di nuovo. Nessun credito usato.",
+   "Не вдалося завантажити 😕 Надішли ще раз. Кредит не списано.",
+   "Не получилось скачать 😕 Пришли ещё раз. Кредит не списан.")
+_L(MSG_TOO_BIG,
+   "Este archivo es demasiado grande 😅 Mándame un clip más corto. No se gastó ningún crédito.",
+   "Este arquivo é grande demais 😅 Mande um clipe mais curto. Nenhum crédito foi usado.",
+   "Die Datei ist zu groß für mich 😅 Schick einen kürzeren Clip. Es wurde kein Credit verbraucht.",
+   "Ce fichier est trop lourd pour moi 😅 Envoie un clip plus court. Aucun crédit utilisé.",
+   "Questo file è troppo grande 😅 Mandami una clip più corta. Nessun credito usato.",
+   "Файл завеликий 😅 Надішли коротший кліп. Кредит не списано.",
+   "Файл слишком большой 😅 Пришли клип покороче. Кредит не списан.")
+_L(MSG_NOT_MEDIA,
+   "Ese enlace no lleva a un video o imagen que pueda leer 🤔 Comparte el Reel directamente.",
+   "Esse link não leva a um vídeo ou imagem que eu consiga ler 🤔 Compartilhe o próprio Reel.",
+   "Der Link führt nicht zu einem Video oder Bild, das ich lesen kann 🤔 Teile bitte das Reel selbst.",
+   "Ce lien ne mène pas à une vidéo ou une image que je peux lire 🤔 Partage directement le Reel.",
+   "Quel link non porta a un video o a un'immagine che posso leggere 🤔 Condividi direttamente il Reel.",
+   "Це посилання не веде до відео чи фото, яке я можу прочитати 🤔 Надішли сам Reels.",
+   "Эта ссылка не ведёт на видео или фото, которое я могу прочитать 🤔 Пришли сам Reels.")
+_L(MSG_UNSUPPORTED,
+   "No pude leer este formato 😕 Mándame un Reel, un video MP4 o una foto JPG/PNG.",
+   "Não consegui ler este formato 😕 Mande um Reel, um vídeo MP4 ou uma foto JPG/PNG.",
+   "Dieses Format kann ich nicht lesen 😕 Schick ein Reel, ein MP4-Video oder ein JPG/PNG-Foto.",
+   "Je ne peux pas lire ce format 😕 Envoie un Reel, une vidéo MP4 ou une photo JPG/PNG.",
+   "Non riesco a leggere questo formato 😕 Mandami un Reel, un video MP4 o una foto JPG/PNG.",
+   "Не можу прочитати цей формат 😕 Надішли Reels, відео MP4 або фото JPG/PNG.",
+   "Не могу прочитать этот формат 😕 Пришли Reels, видео MP4 или фото JPG/PNG.")
+_L(MSG_NO_AUDIO,
+   "Este no tiene sonido, así que no hay canción que buscar 🔇 No se gastó ningún crédito.",
+   "Este não tem som, então não há música para achar 🔇 Nenhum crédito foi usado.",
+   "Das hier hat keinen Ton – also kein Song zum Finden 🔇 Es wurde kein Credit verbraucht.",
+   "Celui-ci n'a pas de son, donc pas de chanson à trouver 🔇 Aucun crédit utilisé.",
+   "Questo non ha audio, quindi nessuna canzone da trovare 🔇 Nessun credito usato.",
+   "Тут немає звуку, тож пісню не знайти 🔇 Кредит не списано.",
+   "Тут нет звука, так что песню не найти 🔇 Кредит не списан.")
+_L(MSG_PHOTO_NO_AUDIO,
+   "Es una foto: no hay sonido que reconocer 🙂 Mándame un Reel o video para buscar canciones. No se gastó ningún crédito.",
+   "É uma foto — não tem som para reconhecer 🙂 Mande um Reel ou vídeo para buscar músicas. Nenhum crédito foi usado.",
+   "Das ist ein Foto – da gibt's keinen Ton 🙂 Für die Songsuche schick ein Reel oder Video. Es wurde kein Credit verbraucht.",
+   "C'est une photo, il n'y a pas de son à reconnaître 🙂 Envoie un Reel ou une vidéo pour chercher une chanson. Aucun crédit utilisé.",
+   "È una foto: non c'è audio da riconoscere 🙂 Mandami un Reel o un video per cercare canzoni. Nessun credito usato.",
+   "Це фото — тут немає звуку 🙂 Для пошуку пісні надішли Reels або відео. Кредит не списано.",
+   "Это фото — тут нет звука 🙂 Для поиска песни пришли Reels или видео. Кредит не списан.")
+_L(MSG_NO_VIDEO,
+   "Es un audio: solo puedo buscar canciones 🎵 Toca «Buscar canción».",
+   "É um áudio — só consigo achar músicas nele 🎵 Toque em “Achar música”.",
+   "Das ist ein Audio – darin kann ich nur Songs finden 🎵 Tippe auf „Song finden“.",
+   "C'est un audio : je ne peux y trouver que des chansons 🎵 Appuie sur « La chanson ».",
+   "È un audio: posso cercare solo canzoni 🎵 Tocca «Trova canzone».",
+   "Це аудіо — тут я можу знайти лише пісню 🎵 Натисни «Знайти пісню».",
+   "Это аудио — тут я могу найти только песню 🎵 Нажми «Найти песню».")
+_L(MSG_NOT_FOUND[FIND_MUSIC],
+   "😕 No pude reconocer la canción de este clip: puede ser un sonido original, una voz en off o un remix muy fuerte.\nNo se gastó ningún crédito.",
+   "😕 Não reconheci a música deste clipe — pode ser um som original, uma narração ou um remix pesado.\nNenhum crédito foi usado.",
+   "😕 Den Song in diesem Clip konnte ich nicht erkennen – evtl. Original-Audio, Voice-over oder ein heftiger Remix.\nEs wurde kein Credit verbraucht.",
+   "😕 Je n'ai pas reconnu la chanson de ce clip : c'est peut-être un son original, une voix off ou un gros remix.\nAucun crédit utilisé.",
+   "😕 Non ho riconosciuto la canzone in questa clip: potrebbe essere un audio originale, una voce fuori campo o un remix pesante.\nNessun credito usato.",
+   "😕 Не вдалося розпізнати пісню — можливо, це оригінальний звук, озвучка або сильний ремікс.\nКредит не списано.",
+   "😕 Не получилось распознать песню — возможно, это оригинальный звук, озвучка или сильный ремикс.\nКредит не списан.")
+_L(MSG_NOT_FOUND[FIND_MOVIE],
+   "😕 No pude identificar con seguridad una película o serie: puede ser contenido original.\nNo se gastó ningún crédito.",
+   "😕 Não consegui identificar com certeza um filme ou série — pode ser conteúdo original.\nNenhum crédito foi usado.",
+   "😕 Einen Film oder eine Serie konnte ich hier nicht sicher erkennen – evtl. eigener Content.\nEs wurde kein Credit verbraucht.",
+   "😕 Je n'ai pas pu identifier avec certitude un film ou une série : c'est peut-être du contenu original.\nAucun crédit utilisé.",
+   "😕 Non sono riuscito a identificare con certezza un film o una serie: potrebbe essere un contenuto originale.\nNessun credito usato.",
+   "😕 Не вдалося впевнено визначити фільм чи серіал — можливо, це авторський контент.\nКредит не списано.",
+   "😕 Не получилось уверенно определить фильм или сериал — возможно, это авторский контент.\nКредит не списан.")
+_L(MSG_NOT_FOUND[FIND_ITEM],
+   "😕 No encontré ropa ni objetos identificables aquí.\nNo se gastó ningún crédito.",
+   "😕 Não encontrei roupas ou itens identificáveis aqui.\nNenhum crédito foi usado.",
+   "😕 Hier konnte ich keine erkennbaren Klamotten oder Sachen finden.\nEs wurde kein Credit verbraucht.",
+   "😕 Je n'ai repéré aucun vêtement ou objet identifiable ici.\nAucun crédit utilisé.",
+   "😕 Non ho trovato vestiti o oggetti riconoscibili qui.\nNessun credito usato.",
+   "😕 Тут не знайшлося одягу чи речей, які можна впізнати.\nКредит не списано.",
+   "😕 Тут не нашлось одежды или вещей, которые можно опознать.\nКредит не списан.")
+_L(MSG_NOT_FOUND[FIND_ALL],
+   "😕 No encontré canción, película/serie, objetos ni lugar identificables en este.\nNo se gastaron créditos.",
+   "😕 Não achei música, filme/série, itens nem lugar identificáveis neste.\nNenhum crédito foi usado.",
+   "😕 Hier konnte ich weder Song, Film/Serie, erkennbare Sachen noch einen Ort finden.\nEs wurden keine Credits verbraucht.",
+   "😕 Je n'ai trouvé ni chanson, ni film/série, ni objet, ni lieu identifiable ici.\nAucun crédit utilisé.",
+   "😕 Non ho trovato né canzone, né film/serie, né oggetti, né luoghi riconoscibili.\nNessun credito usato.",
+   "😕 Тут не знайшлося ні пісні, ні фільму/серіалу, ні речей, ні місця.\nКредити не списано.",
+   "😕 Тут не нашлось ни песни, ни фильма/сериала, ни вещей, ни места.\nКредиты не списаны.")
+_L(MSG_NOT_FOUND[FIND_PLACE],
+   "😕 No pude reconocer dónde se grabó: puede ser una calle común o un interior.\nNo se gastó ningún crédito.",
+   "😕 Não consegui reconhecer onde foi gravado — pode ser uma rua comum ou um lugar fechado.\nNenhum crédito foi usado.",
+   "😕 Ich konnte nicht erkennen, wo das gedreht wurde – evtl. eine normale Straße oder ein Innenraum.\nEs wurde kein Credit verbraucht.",
+   "😕 Je n'ai pas reconnu où ça a été filmé : peut-être une rue ordinaire ou un intérieur.\nAucun crédit utilisé.",
+   "😕 Non ho riconosciuto dove è stato girato: potrebbe essere una strada qualunque o un interno.\nNessun credito usato.",
+   "😕 Не вдалося впізнати, де це знято — можливо, звичайна вулиця або приміщення.\nКредит не списано.",
+   "😕 Не получилось узнать, где это снято — возможно, обычная улица или помещение.\nКредит не списан.")
+_L(MSG_OVERLOAD,
+   "Sobrecarga temporal, no se descontó tu crédito. Inténtalo de nuevo en un momento.",
+   "Sobrecarga temporária, seu crédito não foi descontado. Tente de novo daqui a pouco.",
+   "Kurz überlastet, dein Credit wurde nicht abgezogen. Versuch es gleich nochmal.",
+   "Surcharge temporaire, ton crédit n'a pas été débité. Réessaie dans un instant.",
+   "Sovraccarico temporaneo, il credito non è stato scalato. Riprova tra poco.",
+   "Тимчасове перевантаження, кредит не списано. Спробуй ще раз за мить.",
+   "Временная перегрузка, кредит не списан. Попробуй ещё раз через минутку.")
+_L(MSG_DATA_DELETED,
+   "Listo ✅ Se eliminaron tus datos: tu ID, saldo, suscripción y el último enlace.\nSi me vuelves a escribir, se creará un perfil nuevo vacío (las búsquedas gratis no se renuevan).",
+   "Pronto ✅ Seus dados foram apagados: seu ID, saldo, assinatura e o último link.\nSe você me escrever de novo, um perfil novo e vazio será criado (as buscas grátis não são renovadas).",
+   "Erledigt ✅ Deine Daten wurden gelöscht: ID, Guthaben, Abo und letzter Medienlink.\nWenn du mir wieder schreibst, wird ein neues leeres Profil angelegt (Gratis-Suchen gibt's nicht erneut).",
+   "C'est fait ✅ Tes données ont été supprimées : ton ID, ton solde, ton abonnement et le dernier lien.\nSi tu m'écris à nouveau, un nouveau profil vide sera créé (les recherches gratuites ne sont pas renouvelées).",
+   "Fatto ✅ I tuoi dati sono stati eliminati: ID, saldo, abbonamento e ultimo link.\nSe mi scrivi di nuovo, verrà creato un nuovo profilo vuoto (le ricerche gratis non si rinnovano).",
+   "Готово ✅ Твої дані видалено: ID, баланс, підписку та останнє посилання.\nЯкщо напишеш знову, створиться новий порожній профіль (безкоштовні пошуки не відновлюються).",
+   "Готово ✅ Твои данные удалены: ID, баланс, подписка и последняя ссылка.\nЕсли напишешь снова, создастся новый пустой профиль (бесплатные поиски не возобновляются).")
+_L(MSG_PAYMENTS_SOON,
+   "Ya usaste todas tus búsquedas gratis 🔋\nLos planes de pago llegan muy pronto. ¡Atento, estaré listo para tu próximo Reel!",
+   "Você usou todas as suas buscas grátis 🔋\nOs planos pagos chegam em breve — fique ligado, estarei pronto para o seu próximo Reel!",
+   "Du hast alle Gratis-Suchen verbraucht 🔋\nBezahlpläne kommen sehr bald – bleib dran, ich bin bereit für dein nächstes Reel!",
+   "Tu as utilisé toutes tes recherches gratuites 🔋\nLes offres payantes arrivent très bientôt — reste à l'écoute, je serai prêt pour ton prochain Reel !",
+   "Hai usato tutte le ricerche gratuite 🔋\nI piani a pagamento arrivano prestissimo: resta sintonizzato, sarò pronto per il tuo prossimo Reel!",
+   "Безкоштовні пошуки закінчилися 🔋\nПлатні тарифи вже зовсім скоро — стеж за новинами!",
+   "Бесплатные поиски закончились 🔋\nПлатные тарифы уже совсем скоро — следи за новостями!")
+_L(MSG_PAYMENT_CREDITS,
+   "✅ Pago recibido, ¡gracias! +{n} créditos añadidos.\nTu saldo: {balance} créditos.\nMándame cualquier Reel para seguir 🎬",
+   "✅ Pagamento recebido — obrigado! +{n} créditos adicionados.\nSeu saldo: {balance} créditos.\nMande qualquer Reel para continuar 🎬",
+   "✅ Zahlung erhalten – danke! +{n} Credits hinzugefügt.\nDein Guthaben: {balance} Credits.\nSchick mir ein Reel, um weiterzumachen 🎬",
+   "✅ Paiement reçu, merci ! +{n} crédits ajoutés.\nTon solde : {balance} crédits.\nEnvoie-moi un Reel pour continuer 🎬",
+   "✅ Pagamento ricevuto, grazie! +{n} crediti aggiunti.\nSaldo: {balance} crediti.\nMandami un Reel per continuare 🎬",
+   "✅ Оплату отримано — дякую! +{n} кредитів.\nБаланс: {balance} кредитів.\nНадсилай Reels 🎬",
+   "✅ Оплата получена — спасибо! +{n} кредитов.\nБаланс: {balance} кредитов.\nПрисылай Reels 🎬")
+_L(MSG_PAYMENT_SUB,
+   "✅ ¡Ilimitado activo hasta el {date}! 🔥\nMándame cualquier Reel: todas las búsquedas van por mi cuenta.",
+   "✅ Ilimitado ativo até {date}! 🔥\nMande qualquer Reel — agora todas as buscas são por minha conta.",
+   "✅ Unlimited ist aktiv bis {date}! 🔥\nSchick mir beliebige Reels – jede Suche geht jetzt auf mich.",
+   "✅ Illimité actif jusqu'au {date} ! 🔥\nEnvoie-moi n'importe quel Reel, toutes les recherches sont offertes.",
+   "✅ Illimitato attivo fino al {date}! 🔥\nMandami qualsiasi Reel: ogni ricerca è inclusa.",
+   "✅ Безліміт активний до {date}! 🔥\nНадсилай будь-які Reels — усі пошуки включено.",
+   "✅ Безлимит активен до {date}! 🔥\nПрисылай любые Reels — все поиски включены.")
+
+
 def welcome_text(bot_name: str, balance_line: str) -> str:
-    return (
-        f"Hey there! 👋 I'm {bot_name}.\n\n"
-        "Send me any Reel (tap ✈️ under the Reel → send it to me), a video or a photo, "
-        "and in a few seconds I'll find:\n"
-        "🎵 the song\n🎬 the movie or TV show\n👕 the outfit & items\n\n"
-        f"{balance_line}"
-    )
+    return _t(
+        "Hey there! 👋 I'm {bot_name}.\n\nSend me any Reel (tap ✈️ under the Reel → send it to me), a video or a photo, "
+        "and in a few seconds I'll find:\n🎵 the song\n🎬 the movie or TV show\n👕 the outfit & items\n📍 the place\n\n{balance}",
+        bot_name=bot_name, balance=balance_line)
 
 
 def private_reply_text(free_credits: int) -> str:
@@ -308,7 +845,7 @@ UNSUPPORTED_LINK_DOMAINS = (
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 FIND_KEYWORD_RE = re.compile(r"\bfind\b", re.IGNORECASE)
 
-BUILD = "2026-11-27 reels-fix"  # shown in the startup log to confirm which code is deployed
+BUILD = "2026-11-27 places-lists-invites"  # shown in the startup log to confirm which code is deployed
 IG_TEXT_LIMIT = 950  # Instagram text messages must be < 1000 characters
 
 
@@ -403,6 +940,26 @@ CREATE TABLE IF NOT EXISTS users (
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_media_type TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_notice  TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_media_mid  TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS lang            TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS ref_code        TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS users_ref_code_idx ON users (ref_code);
+
+CREATE TABLE IF NOT EXISTS finds (            -- "My lists": what the bot found for each user
+    id          BIGSERIAL PRIMARY KEY,
+    igsid       TEXT NOT NULL,
+    kind        TEXT NOT NULL,                -- song / movie / item / place
+    title       TEXT NOT NULL,
+    subtitle    TEXT NOT NULL DEFAULT '',
+    url         TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS finds_user_kind_title_idx ON finds (igsid, kind, title);
+
+CREATE TABLE IF NOT EXISTS referrals (
+    referee_hash TEXT PRIMARY KEY,            -- hashed invited user: one invite bonus per person, ever
+    referrer     TEXT NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at      TIMESTAMPTZ NOT NULL DEFAULT now();
 
 CREATE TABLE IF NOT EXISTS payment_events (
@@ -447,6 +1004,8 @@ ALTER TABLE deleted_users  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE app_kv         ENABLE ROW LEVEL SECURITY;
 ALTER TABLE promo_codes    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE promo_redemptions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE finds          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE referrals      ENABLE ROW LEVEL SECURITY;
 """
 
 
@@ -536,6 +1095,8 @@ class Database:
         assert self.pool
         async with self.pool.acquire() as conn, conn.transaction():
             await conn.execute("DELETE FROM users WHERE igsid = $1", igsid)
+            await conn.execute("DELETE FROM finds WHERE igsid = $1", igsid)
+            await conn.execute("DELETE FROM referrals WHERE referrer = $1", igsid)
             await conn.execute(
                 "INSERT INTO deleted_users (id_hash) VALUES ($1) ON CONFLICT (id_hash) DO NOTHING",
                 self._id_hash(igsid))
@@ -599,6 +1160,88 @@ class Database:
                 "UPDATE users SET credits = credits + $2::int, updated_at = now() WHERE igsid = $1 RETURNING credits",
                 igsid, promo["credits"])
             return "ok", promo["credits"], balance or 0
+
+    # ---- My lists
+    async def save_finds(self, igsid: str, finds: list[tuple[str, str, str, str]], keep: int = 100) -> None:
+        if not finds:
+            return
+        assert self.pool
+        async with self.pool.acquire() as conn, conn.transaction():
+            await conn.executemany(
+                """INSERT INTO finds (igsid, kind, title, subtitle, url) VALUES ($1, $2, $3, $4, $5)
+                   ON CONFLICT (igsid, kind, title) DO UPDATE
+                   SET subtitle = EXCLUDED.subtitle, url = EXCLUDED.url, created_at = now()""",
+                [(igsid, k, t[:200], st[:200], u[:1000]) for k, t, st, u in finds])
+            await conn.execute(  # keep only the newest `keep` per kind
+                """DELETE FROM finds f USING (
+                       SELECT id, row_number() OVER (PARTITION BY kind ORDER BY created_at DESC) AS rn
+                       FROM finds WHERE igsid = $1) old
+                   WHERE f.id = old.id AND old.rn > $2::int""", igsid, keep)
+
+    async def count_finds(self, igsid: str) -> dict[str, int]:
+        assert self.pool
+        rows = await self.pool.fetch("SELECT kind, count(*) AS n FROM finds WHERE igsid = $1 GROUP BY kind", igsid)
+        return {r["kind"]: r["n"] for r in rows}
+
+    async def list_finds(self, igsid: str, kind: str, limit: int = 30) -> list[asyncpg.Record]:
+        assert self.pool
+        return await self.pool.fetch(
+            "SELECT * FROM finds WHERE igsid = $1 AND kind = $2 ORDER BY created_at DESC LIMIT $3::int",
+            igsid, kind, limit)
+
+    # ---- Referrals
+    async def ref_code(self, igsid: str) -> str:
+        assert self.pool
+        await self.get_or_create_user(igsid)
+        code = await self.pool.fetchval("SELECT ref_code FROM users WHERE igsid = $1", igsid)
+        while not code:
+            candidate = "REF-" + secrets.token_hex(3).upper()
+            try:
+                code = await self.pool.fetchval(
+                    "UPDATE users SET ref_code = $2 WHERE igsid = $1 AND ref_code IS NULL RETURNING ref_code",
+                    igsid, candidate) or await self.pool.fetchval(
+                    "SELECT ref_code FROM users WHERE igsid = $1", igsid)
+            except asyncpg.UniqueViolationError:
+                continue
+        return code
+
+    async def redeem_referral(self, igsid: str, code: str, credits: int, daily_cap: int,
+                              new_user_days: int = 7) -> tuple[str, str, int, int]:
+        """→ (status, referrer, referee_balance, referrer_balance).
+        status: ok | unknown | self | used | old | cap."""
+        assert self.pool
+        async with self.pool.acquire() as conn, conn.transaction():
+            referrer = await conn.fetchval("SELECT igsid FROM users WHERE ref_code = $1", code)
+            if not referrer:
+                return "unknown", "", 0, 0
+            if referrer == igsid:
+                return "self", referrer, 0, 0
+            me = await conn.fetchrow("SELECT created_at FROM users WHERE igsid = $1", igsid)
+            if me and me["created_at"] < datetime.now(timezone.utc) - timedelta(days=new_user_days):
+                return "old", referrer, 0, 0
+            today = await conn.fetchval(
+                "SELECT count(*) FROM referrals WHERE referrer = $1 AND created_at > now() - interval '1 day'",
+                referrer)
+            if today >= daily_cap:
+                return "cap", referrer, 0, 0
+            inserted = await conn.execute(
+                "INSERT INTO referrals (referee_hash, referrer) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                self._id_hash(igsid), referrer)
+            if not inserted.endswith("1"):
+                return "used", referrer, 0, 0
+            add = "UPDATE users SET credits = credits + $2::int, updated_at = now() WHERE igsid = $1 RETURNING credits"
+            mine = await conn.fetchval(add, igsid, credits)
+            theirs = await conn.fetchval(add, referrer, credits)
+            return "ok", referrer, mine or 0, theirs or 0
+
+    async def get_lang(self, igsid: str) -> str | None:
+        assert self.pool
+        return await self.pool.fetchval("SELECT lang FROM users WHERE igsid = $1", igsid)
+
+    async def set_lang(self, igsid: str, lang: str) -> None:
+        assert self.pool
+        await self.get_or_create_user(igsid)
+        await self.pool.execute("UPDATE users SET lang = $2, updated_at = now() WHERE igsid = $1", igsid, lang)
 
     async def add_credits(self, igsid: str, amount: int) -> int:
         assert self.pool
@@ -921,6 +1564,31 @@ class InstagramClient:
             out.extend((conv.get("messages") or {}).get("data") or [])
         return out
 
+    async def get_mentioned_comment(self, comment_id: str) -> dict[str, Any]:
+        fields = f"mentioned_comment.comment_id({comment_id}){{text,username,media{{id,permalink,media_type}}}}"
+        return (await self._get(self._account_id, {"fields": fields})).get("mentioned_comment") or {}
+
+    async def get_mentioned_media(self, media_id: str) -> dict[str, Any]:
+        fields = f"mentioned_media.media_id({media_id}){{caption,username,permalink,media_type}}"
+        return (await self._get(self._account_id, {"fields": fields})).get("mentioned_media") or {}
+
+    async def reply_to_mention(self, media_id: str, comment_id: str, message: str) -> None:
+        """Public reply under the comment (or the caption) where our account was @mentioned."""
+        params = {"media_id": media_id, "message": message}
+        if comment_id:
+            params["comment_id"] = comment_id
+        resp = await self._http.post(f"{self._base}/{self._account_id}/mentions", params=params,
+                                     headers={"Authorization": f"Bearer {self.token}"},
+                                     timeout=httpx.Timeout(10.0, connect=3.0))
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        if resp.status_code >= 400 or "error" in data:
+            err = data.get("error") or {}
+            raise GraphAPIError(resp.status_code, err.get("code"), err.get("error_subcode"),
+                                err.get("message") or resp.text[:300])
+
     async def subscribe_app(self, fields: str) -> dict[str, Any]:
         """Subscribes the Instagram account to this app's webhooks (needed for Unified login)."""
         resp = await self._http.post(
@@ -1037,6 +1705,9 @@ class ResolvedPost:
     music_title: str = ""    # Instagram's own audio label
     music_artist: str = ""
     music_original: bool = False  # True = "original audio" (user-uploaded), False = licensed track
+    location: str = ""           # Instagram location tag, e.g. "Santorini, Greece"
+    location_lat: float | None = None
+    location_lng: float | None = None
 
 
 def pick_post_formats(info: dict) -> ResolvedPost:
@@ -1046,12 +1717,16 @@ def pick_post_formats(info: dict) -> ResolvedPost:
         with_video = [e for e in entries if e.get("formats") or e.get("url")]
         parent = info
         info = dict((with_video or entries or [{}])[0])
-        for key in ("description", "ig_music"):
+        for key in ("description", "ig_music", "ig_location"):
             info.setdefault(key, parent.get(key))
     music = info.get("ig_music") or {}
     out = ResolvedPost(thumbnail=_s(info.get("thumbnail")), caption=_s(info.get("description"))[:600],
                        music_title=_s(music.get("title")), music_artist=_s(music.get("artist")),
                        music_original=bool(music.get("original")))
+    loc = info.get("ig_location") or {}
+    out.location = _s(loc.get("name"))[:120]
+    if isinstance(loc.get("lat"), (int, float)) and isinstance(loc.get("lng"), (int, float)):
+        out.location_lat, out.location_lng = float(loc["lat"]), float(loc["lng"])
     formats = [f for f in (info.get("formats") or []) if _s(f.get("url")).startswith("http")]
     if not formats and _s(info.get("url")).startswith("http"):
         formats = [info]
@@ -1117,6 +1792,12 @@ def _hook_ytdl_instagram() -> None:
                 raw = product_info[0] if isinstance(product_info, list) else product_info
                 if isinstance(info, dict) and isinstance(raw, dict):
                     info["ig_music"] = ig_music_from_product(raw)
+                    loc = raw.get("location") or {}
+                    if isinstance(loc, dict) and _s(loc.get("name")):
+                        name, city = _s(loc.get("name")), _s(loc.get("city"))
+                        if city and city.lower() not in name.lower():
+                            name = f"{name}, {city}"
+                        info["ig_location"] = {"name": name, "lat": loc.get("lat"), "lng": loc.get("lng")}
             except Exception:  # noqa: BLE001
                 pass
             return info
@@ -1635,10 +2316,24 @@ ITEMS_SCHEMA: dict[str, Any] = {
     "required": ["found", "items"],
 }
 
+PLACE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "found": {"type": "boolean"},
+        "name": {"type": "string", "description": "Specific place: landmark, venue, beach, street, viewpoint…"},
+        "city": {"type": "string"},
+        "country": {"type": "string"},
+        "kind": {"type": "string", "description": "landmark / restaurant / hotel / beach / nature / street / …"},
+        "description": {"type": "string", "description": "One sentence: what it is and why it's worth a visit"},
+        "confidence": {"type": "number"},
+    },
+    "required": ["found", "name", "city", "country", "confidence"],
+}
+
 ALL_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "properties": {"movie": MOVIE_SCHEMA, "items": ITEMS_SCHEMA},
-    "required": ["movie", "items"],
+    "properties": {"movie": MOVIE_SCHEMA, "items": ITEMS_SCHEMA, "place": PLACE_SCHEMA},
+    "required": ["movie", "items", "place"],
 }
 
 _MOVIE_RULES = (
@@ -1657,12 +2352,21 @@ _ITEMS_RULES = (
     "description, and a precise shopping search query (brand + model + color + item type, or a descriptive "
     "query if brand is unknown). confidence is 0..1. found=false if nothing identifiable is visible."
 )
+_PLACE_RULES = (
+    "PLACE TASK: Identify where this was filmed: a specific landmark, city, beach, restaurant, hotel, street or "
+    "nature spot. Use architecture, skyline, landscape, signs, shop names, licence plates, language on signs, "
+    "and the Reel caption / location tag if given. Be as specific as possible (e.g. 'Oia viewpoint, Santorini' "
+    "rather than just 'Greece'). If it's a generic room, studio or an unrecognisable street, set found=false. "
+    "Never invent a place; confidence is 0..1 (0.8+ only if you clearly recognise it)."
+)
 PROMPTS = {
     FIND_MOVIE: ("You receive up to 3 frames (20%, 50%, 80% of the clip) from an Instagram Reel. " + _MOVIE_RULES, MOVIE_SCHEMA),
     FIND_ITEM: ("You receive up to 3 frames (20%, 50%, 80% of the clip) from an Instagram Reel or a photo. " + _ITEMS_RULES, ITEMS_SCHEMA),
+    FIND_PLACE: ("You receive up to 3 frames (20%, 50%, 80% of the clip) from an Instagram Reel or a photo. " + _PLACE_RULES, PLACE_SCHEMA),
     FIND_ALL: (
-        "You receive up to 3 frames (20%, 50%, 80% of the clip) from an Instagram Reel. Solve BOTH tasks and "
-        "return them under the keys `movie` and `items`.\n" + _MOVIE_RULES + "\n" + _ITEMS_RULES,
+        "You receive up to 3 frames (20%, 50%, 80% of the clip) from an Instagram Reel. Solve ALL THREE tasks and "
+        "return them under the keys `movie`, `items` and `place`.\n" + _MOVIE_RULES + "\n" + _ITEMS_RULES
+        + "\n" + _PLACE_RULES,
         ALL_SCHEMA,
     ),
 }
@@ -1741,8 +2445,15 @@ class VisionClient:
             return genai_types.ThinkingConfig(thinking_level=level)
         return None
 
-    async def analyze(self, task: str, frames: list[bytes]) -> dict:
+    async def analyze(self, task: str, frames: list[bytes], context: str = "") -> dict:
         prompt, schema = PROMPTS[task]
+        if context:
+            prompt += "\n\nContext from the Reel (may help, may be unrelated):\n" + context[:800]
+        lang = CURRENT_LANG.get()
+        if lang != "en" and lang in LANGUAGES:
+            prompt += (f"\n\nWrite all descriptive text values (scene, description, color, category, kind) in "
+                       f"{LANGUAGES[lang][1]}. Keep proper names (titles, brands, models, actors) unchanged and "
+                       "keep search_query in English.")
         contents: list[Any] = [genai_types.Part.from_bytes(data=f, mime_type="image/jpeg") for f in frames]
         contents.append(prompt)
         try:
@@ -1986,7 +2697,7 @@ def format_song(result: dict, links: bool = True) -> str:
         f"https://open.spotify.com/search/{quote_plus(f'{artist} {title}')}"
     )
     apple = (result.get("apple_music") or {}).get("url") or f"https://music.apple.com/us/search?term={query}"
-    lines = ["🎵 Song found!"]
+    lines = [_t("🎵 Song found!")]
     if result.get("_note"):
         lines.append(_s(result["_note"]))
     lines.append(f"{artist} — {title}")
@@ -2012,11 +2723,12 @@ def format_movie(data: dict) -> str:
     original = _s(data.get("original_title"))
     kind = {"movie": "Movie", "tv_series": "TV series", "anime": "Anime", "documentary": "Documentary",
             "music_video": "Music video"}.get(_s(data.get("kind")), "")
+    kind = _t(kind) if kind else ""
     season, episode = _s(data.get("season")), _s(data.get("episode"))
     head = f"{title} ({year})" if year else title
     if original and original.lower() != title.lower():
         head += f" / {original}"
-    lines = ["🎬 It's from:", head]
+    lines = [_t("🎬 It's from:"), head]
     meta = kind
     if season or episode:
         se = f"S{season}" if season else ""
@@ -2026,26 +2738,27 @@ def format_movie(data: dict) -> str:
         lines.append(f"📺 {meta}")
     actors = [a for a in (data.get("actors") or []) if _s(a)][:4]
     if actors:
-        lines.append(f"🎭 Cast: {', '.join(actors)}")
+        lines.append(_t("🎭 Cast: {x}", x=", ".join(actors)))
     if _s(data.get("scene")):
-        lines.append(f"📍 Scene: {_s(data.get('scene'))}")
+        lines.append(_t("📍 Scene: {x}", x=_s(data.get("scene"))))
     if _s(data.get("approx_timestamp")):
-        lines.append(f"⏱ Moment: {_s(data.get('approx_timestamp'))}")
+        lines.append(_t("⏱ Moment: {x}", x=_s(data.get("approx_timestamp"))))
     try:
         conf = float(data.get("confidence") or 0)
     except (TypeError, ValueError):
         conf = 0.0
-    lines.append(f"🎯 Confidence: {'high' if conf >= 0.8 else 'medium'}")
+    lines.append(_t("🎯 Confidence: high") if conf >= 0.8 else _t("🎯 Confidence: medium"))
     return "\n".join(lines)
 
 
 def movie_card(data: dict) -> dict:
     title, year = _s(data.get("title")), _s(data.get("year"))
     q = quote_plus(f"{title} {year}".strip())
-    return make_card(f"🎬 {title}" + (f" ({year})" if year else ""), "Where to watch & details", [
-        url_button("📺 Where to watch", f"https://www.justwatch.com/us/search?q={quote_plus(title)}"),
+    region = {"es": "es", "pt": "br", "de": "de", "fr": "fr", "it": "it", "uk": "ua"}.get(CURRENT_LANG.get(), "us")
+    return make_card(f"🎬 {title}" + (f" ({year})" if year else ""), _t("Where to watch & details"), [
+        url_button(_t("📺 Where to watch"), f"https://www.justwatch.com/{region}/search?q={quote_plus(title)}"),
         url_button("⭐ IMDb", f"https://www.imdb.com/find/?q={q}"),
-        url_button("🎞 Trailer", f"https://www.youtube.com/results?search_query={q}+trailer"),
+        url_button(_t("🎞 Trailer"), f"https://www.youtube.com/results?search_query={q}+trailer"),
     ])
 
 
@@ -2062,7 +2775,7 @@ def filter_items(data: dict) -> list[dict]:
 
 
 def format_items(items: list[dict]) -> str:
-    lines = ["👕 Items spotted:"]
+    lines = [_t("👕 Items spotted:")]
     for i, it in enumerate(items, 1):
         brand = _s(it.get("brand"))
         brand = "" if brand.lower() in ("unknown", "n/a", "none") else brand
@@ -2075,7 +2788,52 @@ def format_items(items: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def place_is_found(data: dict) -> bool:
+    try:
+        conf = float(data.get("confidence") or 0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    return bool(data.get("found")) and bool(_s(data.get("name"))) and conf >= 0.5
+
+
+def place_where(data: dict) -> str:
+    return ", ".join(x for x in (_s(data.get("city")), _s(data.get("country")))
+                     if x and x.lower() not in _s(data.get("name")).lower())
+
+
+def format_place(data: dict) -> str:
+    lines = [_t("📍 Place found!"), _s(data.get("name"))]
+    if place_where(data):
+        lines.append(f"🏙 {place_where(data)}")
+    if _s(data.get("description")):
+        lines.append(_s(data.get("description")))
+    try:
+        conf = float(data.get("confidence") or 0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    lines.append(_t("🎯 Confidence: high") if conf >= 0.8 else _t("🎯 Confidence: medium"))
+    return "\n".join(lines)
+
+
+def place_maps_url(data: dict) -> str:
+    if isinstance(data.get("_lat"), float) and isinstance(data.get("_lng"), float):
+        return f"https://www.google.com/maps/search/?api=1&query={data['_lat']},{data['_lng']}"
+    q = quote_plus(", ".join(x for x in (_s(data.get("name")), place_where(data)) if x))
+    return f"https://www.google.com/maps/search/?api=1&query={q}"
+
+
+def place_card(data: dict) -> dict:
+    q = quote_plus(", ".join(x for x in (_s(data.get("name")), place_where(data)) if x))
+    return make_card(f"📍 {_s(data.get('name'))}", place_where(data), [
+        url_button("🗺 Google Maps", place_maps_url(data)),
+        url_button(_t("🔎 Photos & info"), f"https://www.google.com/search?q={q}"),
+        url_button("🧳 Tripadvisor", f"https://www.tripadvisor.com/Search?q={q}"),
+    ])
+
+
 def item_cards(items: list[dict]) -> list[dict]:
+    amazon = {"es": "amazon.es", "pt": "amazon.com.br", "de": "amazon.de", "fr": "amazon.fr",
+              "it": "amazon.it"}.get(CURRENT_LANG.get(), "amazon.com")
     cards = []
     for i, it in enumerate(items, 1):
         q = _s(it.get("search_query"))
@@ -2084,7 +2842,7 @@ def item_cards(items: list[dict]) -> list[dict]:
         name = " ".join(x for x in (brand, _s(it.get("model"))) if x) or _s(it.get("category")).capitalize()
         cards.append(make_card(f"{i}. {name}", f"🔎 {q}", [
             url_button("🛍 Google Shopping", f"https://www.google.com/search?tbm=shop&q={quote_plus(q)}"),
-            url_button("📦 Amazon", f"https://www.amazon.com/s?k={quote_plus(q)}"),
+            url_button("📦 Amazon", f"https://www.{amazon}/s?k={quote_plus(q)}"),
         ]))
     return cards
 
@@ -2101,6 +2859,8 @@ class BranchResult:
     failed: bool = False   # upstream API failure (do not charge for it)
     skipped: bool = False  # branch could not run (e.g. photo has no audio)
     cards: list[dict] = field(default_factory=list)  # tappable link buttons
+    finds: list[tuple[str, str, str, str]] = field(default_factory=list)  # (kind, title, subtitle, url) → lists
+    summary: str = ""  # one short line, used for public comment replies
 
 
 @dataclass
@@ -2140,14 +2900,23 @@ class Bot:
         self.jobs = asyncio.Semaphore(settings.max_parallel_jobs)
         self.seen_accounts: set[str] = set()
         self.admin_fails: dict[str, int] = {}
+        self.langs: TTLCache = TTLCache(maxsize=20_000, ttl=3600)
+        self.mention_times: deque[float] = deque()
+        self.mention_cache: TTLCache = TTLCache(maxsize=2000, ttl=6 * 3600)
         self.redeem_fails: dict[str, int] = {}
         self.reels = ReelExtractor(settings.ig_cookies, settings.download_proxy, settings.tmp_root)
 
     # ---------------------------------------------------------------- helpers
 
+    @staticmethod
+    def localized_replies(quick_replies: list[dict] | None) -> list[dict] | None:
+        if not quick_replies or CURRENT_LANG.get() == "en":
+            return quick_replies
+        return [{**q, "title": _t(q["title"])} for q in quick_replies]
+
     async def safe_send(self, igsid: str, text: str, quick_replies: list[dict] | None = None) -> bool:
         try:
-            await self.ig.send_text(igsid, text, quick_replies)
+            await self.ig.send_text(igsid, _t(text), self.localized_replies(quick_replies))
             return True
         except GraphAPIError as exc:
             log.error("send_text to %s failed: %s", igsid, exc)
@@ -2166,9 +2935,9 @@ class Bot:
 
     def balance_line(self, user: asyncpg.Record, credits: int | None = None) -> str:
         if self.is_subscribed(user):
-            return f"⭐ Unlimited until {user['sub_until']:%b %d, %Y}"
+            return _t("⭐ Unlimited until {date}", date=f"{user['sub_until']:%b %d, %Y}")
         n = user["credits"] if credits is None else credits
-        return f"💳 Credits left: {n}"
+        return _t("💳 Credits left: {n}", n=n)
 
     def checkout_link(self, base: str, igsid: str) -> str:
         sep = "&" if "?" in base else "?"
@@ -2177,6 +2946,7 @@ class Bot:
     async def send_paywall(self, igsid: str, user: asyncpg.Record, cost: int) -> None:
         if not self.s.lemon_checkout_url:
             await self.safe_send(igsid, MSG_PAYMENTS_SOON)
+            await self.send_invite(igsid)
             return
         credits_url = self.checkout_link(self.s.lemon_checkout_url, igsid)
         buttons = [{"type": "web_url", "url": credits_url, "title": f"Get {self.s.credits_per_pack} credits"}]
@@ -2222,13 +2992,20 @@ class Bot:
             return
         msg = ev.get("message")
         postback = ev.get("postback")
+        if msg and (msg.get("is_echo") or msg.get("is_deleted") or msg.get("is_unsupported")):
+            return
+        lang = await self.user_lang(sender)
+        CURRENT_LANG.set(lang or "en")
 
         if msg:
-            if msg.get("is_echo") or msg.get("is_deleted") or msg.get("is_unsupported"):
-                return
             await self.deliver_pending_notice(sender)
 
-            qr_payload = (msg.get("quick_reply") or {}).get("payload")
+            qr_payload = _s((msg.get("quick_reply") or {}).get("payload"))
+            if qr_payload.startswith("LANG_"):
+                await self.choose_language(sender, qr_payload[5:])
+                return
+            if await self.handle_menu_payload(sender, qr_payload):
+                return
             if qr_payload in ACTIONS:
                 await self.handle_action(sender, qr_payload)
                 return
@@ -2250,10 +3027,54 @@ class Bot:
         if postback:
             await self.deliver_pending_notice(sender)
             payload = _s(postback.get("payload"))
+            if await self.handle_menu_payload(sender, payload):
+                return
             if payload in ACTIONS:
                 await self.handle_action(sender, payload)
             else:
                 await self.handle_text(sender, payload)
+
+    async def handle_menu_payload(self, igsid: str, payload: str) -> bool:
+        if payload == MY_LISTS:
+            await self.show_lists(igsid)
+        elif payload.startswith("LIST_"):
+            await self.show_list(igsid, payload[5:])
+        elif payload == INVITE:
+            await self.send_invite(igsid)
+        else:
+            return False
+        return True
+
+    async def user_lang(self, igsid: str) -> str | None:
+        """User's chosen language ('' cached = not chosen yet)."""
+        if igsid not in self.langs:
+            try:
+                self.langs[igsid] = await self.db.get_lang(igsid) or ""
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Could not read language for %s: %s", igsid, exc)
+                return None
+        return self.langs[igsid] or None
+
+    def needs_language(self, igsid: str) -> bool:
+        return self.s.ask_language and not self.langs.get(igsid)
+
+    async def send_language_picker(self, igsid: str) -> None:
+        await self.safe_send(igsid, MSG_CHOOSE_LANG, lang_picker())
+
+    async def choose_language(self, igsid: str, code: str) -> None:
+        if code not in LANGUAGES:
+            await self.send_language_picker(igsid)
+            return
+        await self.db.set_lang(igsid, code)
+        self.langs[igsid] = code
+        CURRENT_LANG.set(code)
+        log.info("Language for %s set to %s", igsid, code)
+        user = await self.db.get_or_create_user(igsid)
+        if user["last_media_url"]:  # they sent a Reel before choosing → continue with it
+            await self.safe_send(igsid, MSG_LANG_SET)
+            await self.safe_send(igsid, MSG_MENU, QUICK_REPLIES)
+        else:
+            await self.safe_send(igsid, _t(MSG_LANG_SET) + "\n\n" + welcome_text(self.s.bot_name, self.balance_line(user)))
 
     @staticmethod
     def pick_media(attachments: list[dict]) -> tuple[str, str] | None:
@@ -2280,11 +3101,19 @@ class Bot:
         ig_url = instagram_post_url(url)
         if ig_url:
             self.reels.prefetch(ig_url)
-        results = await asyncio.gather(
-            self.db.set_last_media(igsid, url, media_type, mid),
-            self.ig.send_text(igsid, MSG_MENU, QUICK_REPLIES),
-            return_exceptions=True,
-        )
+        if self.needs_language(igsid):  # first contact: language first, the Reel is kept
+            await self.db.get_or_create_user(igsid)
+            results = await asyncio.gather(
+                self.db.set_last_media(igsid, url, media_type, mid),
+                self.ig.send_text(igsid, MSG_CHOOSE_LANG, lang_picker()),
+                return_exceptions=True,
+            )
+        else:
+            results = await asyncio.gather(
+                self.db.set_last_media(igsid, url, media_type, mid),
+                self.ig.send_text(igsid, _t(MSG_MENU), self.localized_replies(QUICK_REPLIES)),
+                return_exceptions=True,
+            )
         for r in results:
             if isinstance(r, Exception):
                 log.error("handle_media error for %s: %s", igsid, r)
@@ -2308,12 +3137,23 @@ class Bot:
             await self.handle_media(igsid, url, "unknown")
             return
 
+        if lowered in LANGUAGE_COMMANDS:
+            await self.send_language_picker(igsid)
+            return
+        if lowered in LIST_COMMANDS:
+            await self.show_lists(igsid)
+            return
+        if lowered in INVITE_COMMANDS:
+            await self.send_invite(igsid)
+            return
+
         if lowered in TEXT_COMMANDS:
             await self.handle_action(igsid, TEXT_COMMANDS[lowered])
             return
 
         if lowered in DELETE_COMMANDS:
             await self.db.delete_user(igsid)
+            self.langs.pop(igsid, None)
             log.info("User data deleted on request")
             await self.safe_send(igsid, MSG_DATA_DELETED)
             return
@@ -2329,7 +3169,92 @@ class Bot:
             return
         if await self.try_redeem(igsid, clean):
             return
+        if self.needs_language(igsid):
+            await self.send_language_picker(igsid)
+            return
         await self.safe_send(igsid, welcome_text(self.s.bot_name, self.balance_line(user)))
+
+    # ---------------------------------------------------------------- invites
+
+    def bot_link(self) -> str:
+        h = self.s.instagram_handle
+        return f"https://ig.me/m/{h}" if h else "this account in Instagram DM"
+
+    async def send_invite(self, igsid: str) -> None:
+        if self.s.referral_credits <= 0:
+            return
+        code = await self.db.ref_code(igsid)
+        n = self.s.referral_credits
+        await self.safe_send(igsid, _t("🎁 Invite friends and get +{n} free searches for each friend who joins — "
+                                       "your friend gets +{n} too!\nJust forward them the next message 👇", n=n))
+        await self.safe_send(igsid, _t("🔥 This bot finds the song, movie, outfit & place from any Instagram Reel "
+                                       "— right in DM!\n\n1️⃣ Open {link}\n2️⃣ Send it this code: {code}\n\n"
+                                       "We both get +{n} free searches 🎁", link=self.bot_link(), code=code, n=n))
+
+    async def redeem_referral(self, igsid: str, code: str) -> bool:
+        if self.s.referral_credits <= 0:
+            return False
+        status, referrer, mine, theirs = await self.db.redeem_referral(
+            igsid, code, self.s.referral_credits, self.s.referral_daily_cap)
+        if status == "unknown":
+            self.redeem_fails[igsid] = self.redeem_fails.get(igsid, 0) + 1
+            return False
+        log.info("Referral %s by %s → %s (referrer %s)", code, igsid, status, referrer)
+        n = self.s.referral_credits
+        msg = {
+            "ok": _t("🎁 Invite code accepted: +{credits} credits!\n💳 Credits left: {balance}\n\nSend me a Reel 👇",
+                     credits=n, balance=mine),
+            "self": _t("That's your own invite code 😄 Share it with friends!"),
+            "used": _t("You've already used an invite code 🙂"),
+            "old": _t("Invite codes are only for new users 🙂"),
+            "cap": _t("This invite code has reached today's limit — try again tomorrow 🙂"),
+        }[status]
+        await self.safe_send(igsid, msg)
+        if status == "ok":
+            lang = CURRENT_LANG.get()
+            await self.notify_payment(referrer, "🎉 A friend joined with your invite code! +{credits} credits\n"
+                                                "💳 Credits left: {balance}", {"credits": n, "balance": theirs})
+            CURRENT_LANG.set(lang)
+        return True
+
+    # ---------------------------------------------------------------- my lists
+
+    LIST_LABELS = {"song": "🎵 Songs ({n})", "movie": "🎬 Movies ({n})", "item": "👕 Items ({n})",
+                   "place": "📍 Places ({n})"}
+    LIST_HEADERS = {"song": "🎵 Your songs ({n}):", "movie": "🎬 Your movies & shows ({n}):",
+                    "item": "👕 Your items ({n}):", "place": "📍 Your places ({n}):"}
+
+    async def show_lists(self, igsid: str) -> None:
+        counts = await self.db.count_finds(igsid)
+        replies = [{"content_type": "text", "title": _t(self.LIST_LABELS[k], n=counts[k]), "payload": f"LIST_{k}"}
+                   for k in LIST_KINDS if counts.get(k)]
+        if not replies:
+            await self.safe_send(igsid, "📚 Your lists are empty for now — every song, movie, item and place I find "
+                                        "for you is saved here automatically.")
+            return
+        await self.ig.send_text(igsid, _t("📚 Your lists — what should I show?"), replies)
+
+    async def show_list(self, igsid: str, kind: str) -> None:
+        if kind not in LIST_KINDS:
+            await self.show_lists(igsid)
+            return
+        rows = await self.db.list_finds(igsid, kind, 30)
+        counts = await self.db.count_finds(igsid)
+        lines = [_t(self.LIST_HEADERS[kind], n=counts.get(kind, 0))]
+        for i, r in enumerate(rows, 1):
+            lines.append(f"{i}. {r['title']}" + (f" — {r['subtitle']}" if r["subtitle"] and kind != "song" else ""))
+        cards = [make_card(r["title"], r["subtitle"], [url_button(_t("🔗 Open"), r["url"])])
+                 for r in rows[:10] if r["url"].startswith("https://")]
+        others = [{"content_type": "text", "title": _t(self.LIST_LABELS[k], n=counts[k]), "payload": f"LIST_{k}"}
+                  for k in LIST_KINDS if k != kind and counts.get(k)]
+        await self.safe_send(igsid, "\n".join(lines), None if cards else others or None)
+        if cards:
+            try:
+                await self.ig.send_generic_template(igsid, cards)
+            except GraphAPIError as exc:
+                log.warning("List cards failed: %s", exc)
+            if others:
+                await self.ig.send_text(igsid, _t("📚 Your lists — what should I show?"), others)
 
     async def handle_admin(self, igsid: str, text: str) -> bool:
         """Secret DM commands (wrong code = ordinary text; 5 wrong tries lock the sender out):
@@ -2394,6 +3319,8 @@ class Bot:
             token = token[7:].strip()
         if not PROMO_RE.fullmatch(token) or self.redeem_fails.get(igsid, 0) >= 20:
             return False
+        if token.startswith("REF-"):
+            return await self.redeem_referral(igsid, token)
         status, credits, balance = await self.db.redeem_promo(igsid, token)
         if status == "unknown":
             if token.startswith("GIFT-"):  # only guessing of private gift codes is rate-limited
@@ -2401,13 +3328,69 @@ class Bot:
             return False
         log.info("Promo %s → %s for %s", token, status, igsid)
         msg = {
-            "ok": f"🎁 Code applied: +{credits} credits!\n💳 Credits left: {balance}\n\n"
-                  "Send me a Reel to use them 👇",
-            "used": "You've already used this code 🙂",
-            "expired": "This code has expired or run out 😕",
+            "ok": _t("🎁 Code applied: +{credits} credits!\n💳 Credits left: {balance}\n\nSend me a Reel to use them 👇",
+                     credits=credits, balance=balance),
+            "used": _t("You've already used this code 🙂"),
+            "expired": _t("This code has expired or run out 😕"),
         }[status]
         await self.safe_send(igsid, msg)
         return True
+
+    async def handle_mention(self, value: dict, own_id: str) -> None:
+        """Someone wrote '@ourbot what song?' under any public Reel → we answer in the comments.
+        Free for the commenter (it's advertising), limited to MENTIONS_PER_HOUR searches."""
+        if not self.s.mentions_enabled:
+            return
+        comment_id, media_id = _s(value.get("comment_id")), _s(value.get("media_id"))
+        if not media_id:
+            return
+        try:
+            if comment_id:
+                data = await self.ig.get_mentioned_comment(comment_id)
+                text, media = _s(data.get("text")), data.get("media") or {}
+                username = _s(data.get("username"))
+            else:
+                media = await self.ig.get_mentioned_media(media_id)
+                text, username = _s(media.get("caption")), _s(media.get("username"))
+        except (GraphAPIError, httpx.HTTPError) as exc:
+            log.warning("Mention %s: could not read it: %s", comment_id or media_id, exc)
+            return
+        if username and username.lower() == self.s.instagram_handle.lower():
+            return
+        permalink = _s(media.get("permalink"))
+        if not instagram_post_url(permalink):
+            log.info("Mention %s: no usable permalink (%r)", comment_id or media_id, permalink)
+            return
+        action, lang = mention_intent(text)
+        CURRENT_LANG.set(lang)
+        key = (media_id, action, lang)
+        reply = self.mention_cache.get(key)
+        if reply is None:
+            now = asyncio.get_running_loop().time()
+            while self.mention_times and now - self.mention_times[0] > 3600:
+                self.mention_times.popleft()
+            if len(self.mention_times) >= self.s.mentions_per_hour:
+                log.warning("Mention %s skipped: hourly limit (%d) reached", comment_id, self.s.mentions_per_hour)
+                return
+            self.mention_times.append(now)
+            log.info("Mention %s by @%s: %s on %s", comment_id or media_id, username, action, describe_url(permalink))
+            try:
+                outcome = await self.run_search(action, permalink)
+            except (MediaUnavailable, ExternalServiceError) as exc:
+                log.info("Mention %s: search failed: %s", comment_id or media_id, exc)
+                return
+            summary = "\n".join(b.summary for b in outcome.branches.values() if b.found and b.summary)
+            reply = (summary + "\n\n" + _t("👋 DM me any Reel — I find songs, movies, outfits & places!"))[:900] \
+                if summary else ""
+            self.mention_cache[key] = reply
+        if not reply:
+            log.info("Mention %s: nothing found → no reply", comment_id or media_id)
+            return
+        try:
+            await self.ig.reply_to_mention(media_id, comment_id, reply)
+            log.info("Mention %s answered", comment_id or media_id)
+        except (GraphAPIError, httpx.HTTPError) as exc:
+            log.warning("Mention %s: reply failed: %s", comment_id or media_id, exc)
 
     async def handle_comment(self, value: dict, own_id: str) -> None:
         text = _s(value.get("text"))
@@ -2458,6 +3441,7 @@ class Bot:
                 # FIND_ALL where one half failed / couldn't run is charged as a single search.
                 charge = cost if not outcome.partial else 1
                 footer: str
+                new_balance: int | None = None
                 if subscribed:
                     footer = self.balance_line(user)
                 else:
@@ -2467,20 +3451,28 @@ class Bot:
                         new_balance = max(user["credits"] - charge, 0)
                     footer = self.balance_line(user, new_balance)
 
+                try:
+                    await self.db.save_finds(igsid, [f for b in outcome.branches.values() for f in b.finds])
+                except Exception as exc:  # noqa: BLE001 — lists are a bonus, never break the answer
+                    log.warning("Could not save finds for %s: %s", igsid, exc)
+
                 blocks = [b.text for b in outcome.branches.values() if b.text]
                 blocks.append(footer)
                 cards = [c for b in outcome.branches.values() for c in b.cards][:10]
                 if not cards:
                     blocks.append("Want something else from this Reel? 👇")
                     await self.safe_send(igsid, "\n\n".join(blocks), QUICK_REPLIES)
-                    return
-                await self.safe_send(igsid, "\n\n".join(blocks))
-                try:
-                    await self.ig.send_generic_template(igsid, cards)
-                except GraphAPIError as exc:
-                    log.warning("Link buttons failed (%s) → sending links as text", exc)
-                    await self.safe_send(igsid, cards_as_text(cards))
-                await self.safe_send(igsid, "Want something else from this Reel? 👇", QUICK_REPLIES)
+                else:
+                    await self.safe_send(igsid, "\n\n".join(blocks))
+                    try:
+                        await self.ig.send_generic_template(igsid, cards)
+                    except GraphAPIError as exc:
+                        log.warning("Link buttons failed (%s) → sending links as text", exc)
+                        await self.safe_send(igsid, cards_as_text(cards))
+                    await self.safe_send(igsid, "Want something else from this Reel? 👇", QUICK_REPLIES)
+                if new_balance == 0:  # just used the last free search → offer the invite bonus
+                    await self.safe_send(igsid, "🔋 That was your last free search.")
+                    await self.send_invite(igsid)
             except Exception:  # noqa: BLE001 — never leave the user hanging
                 log.exception("Unexpected error while handling %s for %s", action, igsid)
                 await self.safe_send(igsid, MSG_OVERLOAD)
@@ -2495,7 +3487,7 @@ class Bot:
             try:
                 src = workdir / "source"
                 ctype = await self.download_with_fallback(
-                    media_url, mid, src, cover_ok=action in (FIND_MOVIE, FIND_ITEM))
+                    media_url, mid, src, cover_ok=action in (FIND_MOVIE, FIND_ITEM, FIND_PLACE))
                 info = await probe_media(src, ctype)
                 log.info("Media: kind=%s duration=%.1fs audio=%s ctype=%s",
                          info.kind, info.duration, info.has_audio, ctype)
@@ -2504,8 +3496,9 @@ class Bot:
                 if action in (FIND_MUSIC, FIND_ALL):
                     tasks["music"] = self._music_branch(info, workdir, strict=action == FIND_MUSIC,
                                                         hint=self.reels.cached(media_url))
-                if action in (FIND_MOVIE, FIND_ITEM, FIND_ALL):
-                    tasks["vision"] = self._vision_branch(action, info, workdir, strict=action != FIND_ALL)
+                if action in (FIND_MOVIE, FIND_ITEM, FIND_PLACE, FIND_ALL):
+                    tasks["vision"] = self._vision_branch(action, info, workdir, strict=action != FIND_ALL,
+                                                          hint=self.reels.cached(media_url))
 
                 # Music (ffmpeg → AudD) and vision (ffmpeg → Gemini) run in parallel.
                 results = await asyncio.gather(*tasks.values(), return_exceptions=True)
@@ -2518,11 +3511,11 @@ class Bot:
                 if action == FIND_ALL and outcome.any_found:
                     music, vision = outcome.branches["music"], outcome.branches["vision"]
                     if not music.found and not music.text:
-                        music.text = ("🎵 Song: search temporarily unavailable" if music.failed
-                                      else "🎵 Song: not recognised")
+                        music.text = _t("🎵 Song: search temporarily unavailable" if music.failed
+                                        else "🎵 Song: not recognised")
                     if not vision.found and not vision.text:
-                        vision.text = ("🎬 Movie & 👕 items: temporarily unavailable" if vision.failed
-                                       else "🎬 Movie & 👕 items: nothing identifiable")
+                        vision.text = _t("🎬 Movie, 👕 items & 📍 place: temporarily unavailable" if vision.failed
+                                         else "🎬 Movie, 👕 items & 📍 place: nothing identifiable")
                 return outcome
             finally:
                 shutil.rmtree(workdir, ignore_errors=True)
@@ -2696,9 +3689,9 @@ class Bot:
             return None
         version = _s(data.get("version")).lower()
         if version and version not in ("original", "unknown", "n/a", "none"):
-            verified["_note"] = f"🎛 This Reel uses a {version[:40]} of:"
+            verified["_note"] = _t("🎛 This Reel uses a {v} of:", v=version[:40])
         elif conf < 0.8:
-            verified["_note"] = "🤔 Most likely:"
+            verified["_note"] = _t("🤔 Most likely:")
         return verified
 
     async def recognize_song(self, info: MediaInfo, workdir: Path,
@@ -2750,8 +3743,8 @@ class Bot:
                 for rate, res in zip(rates, variants, strict=True):
                     if res and not isinstance(res, BaseException):
                         log.info("Song found by Shazam at speed x%.2f in %.1fs", 1 / rate, loop.time() - started)
-                        res["_note"] = ("⚡ This Reel uses a sped-up version of:" if rate < 1
-                                        else "🐢 This Reel uses a slowed-down version of:")
+                        res["_note"] = _t("⚡ This Reel uses a sped-up version of:" if rate < 1
+                                          else "🐢 This Reel uses a slowed-down version of:")
                         return res
             if ai_task:
                 res = await ai_task
@@ -2776,7 +3769,7 @@ class Bot:
             if strict:
                 raise
             no_sound = exc.user_message in (MSG_NO_AUDIO, MSG_PHOTO_NO_AUDIO)
-            return BranchResult(skipped=True, text="🎵 Song: no sound in this media" if no_sound else "")
+            return BranchResult(skipped=True, text=_t("🎵 Song: no sound in this media") if no_sound else "")
         except ExternalServiceError as exc:
             if strict:
                 raise
@@ -2784,12 +3777,25 @@ class Bot:
             return BranchResult(failed=True)
         if not result:
             return BranchResult(found=False)
-        return BranchResult(found=True, text=format_song(result, links=False), cards=[song_card(result)])
+        card = song_card(result)
+        name = f"{_s(result.get('artist'))} — {_s(result.get('title'))}"
+        return BranchResult(found=True, text=format_song(result, links=False), cards=[card],
+                            finds=[("song", name, _s(result.get("album")), card["buttons"][0]["url"])],
+                            summary=f"🎵 {name}")
 
-    async def _vision_branch(self, action: str, info: MediaInfo, workdir: Path, strict: bool) -> BranchResult:
+    async def _vision_branch(self, action: str, info: MediaInfo, workdir: Path, strict: bool,
+                             hint: ResolvedPost | None = None) -> BranchResult:
+        context = ""
+        if hint:
+            parts = []
+            if hint.location:
+                parts.append(f"Instagram location tag: {hint.location}")
+            if hint.caption:
+                parts.append(f"Caption: {hint.caption}")
+            context = "\n".join(parts)
         try:
             frames = await extract_frames(info, workdir)
-            data = await self.vision.analyze(action, frames)
+            data = await self.vision.analyze(action, frames, context)
         except MediaUnavailable:
             if strict:
                 raise
@@ -2800,30 +3806,53 @@ class Bot:
             log.warning("Vision branch failed: %s", exc)
             return BranchResult(failed=True)
 
-        if action == FIND_MOVIE:
-            return (BranchResult(found=True, text=format_movie(data), cards=[movie_card(data)])
-                    if movie_is_found(data) else BranchResult())
-        if action == FIND_ITEM:
-            items = filter_items(data)
-            return (BranchResult(found=True, text=format_items(items), cards=item_cards(items))
-                    if items else BranchResult())
+        if action == FIND_ALL:
+            movie, items, place = data.get("movie") or {}, filter_items(data.get("items") or {}), data.get("place") or {}
+        else:
+            movie = data if action == FIND_MOVIE else {}
+            items = filter_items(data) if action == FIND_ITEM else []
+            place = data if action == FIND_PLACE else {}
+        if place and hint and hint.location_lat is not None and hint.location_lng is not None:
+            place["_lat"], place["_lng"] = hint.location_lat, hint.location_lng
 
-        # FIND_ALL
-        parts: list[str] = []
-        cards: list[dict] = []
-        movie = data.get("movie") or {}
+        res = BranchResult()
+        texts: list[str] = []
+        summaries: list[str] = []
         if movie_is_found(movie):
-            parts.append(format_movie(movie))
-            cards.append(movie_card(movie))
-        items = filter_items(data.get("items") or {})
+            title, year = _s(movie.get("title")), _s(movie.get("year"))
+            card = movie_card(movie)
+            texts.append(format_movie(movie))
+            res.cards.append(card)
+            head = title + (f" ({year})" if year else "")
+            res.finds.append(("movie", head, _s(movie.get("kind")), card["buttons"][1]["url"]))
+            summaries.append(f"🎬 {head}")
         if items:
-            parts.append(format_items(items))
-            cards += item_cards(items)
-        return BranchResult(found=bool(parts), text="\n\n".join(parts), cards=cards)
+            cards = item_cards(items)
+            texts.append(format_items(items))
+            res.cards += cards
+            for card, it in zip(cards, items, strict=True):
+                name = card["title"].split(". ", 1)[-1]
+                res.finds.append(("item", name, _s(it.get("search_query")), card["buttons"][0]["url"]))
+            summaries.append("👕 " + "; ".join(c["title"].split(". ", 1)[-1] for c in cards[:3]))
+        if place_is_found(place):
+            card = place_card(place)
+            texts.append(format_place(place))
+            res.cards.append(card)
+            res.finds.append(("place", _s(place.get("name")), place_where(place), card["buttons"][0]["url"]))
+            summaries.append(f"📍 {_s(place.get('name'))}" + (f", {place_where(place)}" if place_where(place) else ""))
+        res.found = bool(texts)
+        res.text = "\n\n".join(texts)
+        res.summary = "\n".join(summaries)
+        return res
 
     # ---------------------------------------------------------------- payments
 
-    async def notify_payment(self, igsid: str, text: str) -> None:
+    async def notify_payment(self, igsid: str, template: str, values: dict | None = None) -> None:
+        try:
+            CURRENT_LANG.set(await self.db.get_lang(igsid) or "en")
+        except Exception:  # noqa: BLE001
+            pass
+        text = _t(template, **(values or {}))
         try:
             await self.ig.send_text(igsid, text)
         except GraphAPIError as exc:
@@ -2859,7 +3888,8 @@ class Bot:
             log.error("IG_ACCOUNT_ID must be the numeric Instagram account ID when GRAPH_API_BASE "
                       "is graph.facebook.com (Unified login); got %r", self.s.ig_account_id)
             return
-        for fields in ("messages,messaging_postbacks,comments", "messages,comments"):
+        for fields in ("messages,messaging_postbacks,comments,mentions", "messages,messaging_postbacks,comments",
+                       "messages,comments"):
             try:
                 await self.ig.subscribe_app(fields)
                 log.info("Instagram account %s subscribed to webhooks: %s", self.s.ig_account_id, fields)
@@ -2890,7 +3920,7 @@ class Bot:
 # Privacy policy page (served at /privacy — use this URL in the Meta dashboard)
 # =============================================================================
 
-PRIVACY_EFFECTIVE_DATE = "November 21, 2026"
+PRIVACY_EFFECTIVE_DATE = "November 27, 2026"
 
 PRIVACY_TEMPLATE = string.Template("""<!DOCTYPE html>
 <html lang="en">
@@ -2927,6 +3957,12 @@ what data we process, why, and how you can have it deleted.</p>
       We never receive or store card details; payments are handled by our payment provider.</li>
   <li><b>Comments containing the word "FIND"</b> under our posts — used only to send you a private reply.
       We do not store the comment text.</li>
+  <li><b>Your lists</b> — titles and links of the songs, movies, items and places we found for you
+      (up to 100 per category), so you can see them again with "My lists".</li>
+  <li><b>Your chosen language</b> and, if you use invites, your invite code. The fact that you joined with
+      someone's invite is stored only as a one-way hash.</li>
+  <li><b>Comments where you @mention us</b> under public posts — we read the comment and that post's video
+      to reply publicly in the comments. We do not store the comment text.</li>
   <li><b>Technical server logs</b> (for example, request times and errors), kept for a limited time
       for security and troubleshooting.</li>
 </ul>
@@ -2940,7 +3976,10 @@ processing</b>, usually within seconds. We do not keep your videos or photos.</p
 <p>We share data only to provide the service. We do <b>not</b> sell your data or use it for advertising.</p>
 <ul>
   <li><b>Meta Platforms (Instagram Messaging API)</b> — to receive and send messages.</li>
-  <li><b>Google (Gemini API)</b> — still frames, to recognize movies, shows and items.</li>
+  <li><b>Google (Gemini API)</b> — still frames (and the Reel's caption and location tag), to recognize movies,
+      shows, items and places; a short audio clip when other song search fails.</li>
+  <li><b>Shazam</b> — a short audio clip, to recognize the song.</li>
+  <li><b>Apple (iTunes Search)</b> — the song title, to check that a recognized song really exists.</li>
   <li><b>AudD</b> — an 8-second audio clip, to recognize the song.</li>
   <li><b>Railway</b> — server hosting (United States).</li>
   <li><b>Supabase</b> — database hosting (United States).</li>
@@ -3152,6 +4191,12 @@ async def receive_webhook(request: Request, background: BackgroundTasks) -> Resp
             background.add_task(_run_safely, bot.handle_messaging_event, ev, own_id)
 
         for change in entry.get("changes") or []:
+            if change.get("field") == "mentions":
+                value = change.get("value") or {}
+                key = _s(value.get("comment_id")) or _s(value.get("media_id"))
+                if key and not bot.dedup.seen(f"mn:{key}"):
+                    background.add_task(_run_safely, bot.handle_mention, value, own_id)
+                continue
             if change.get("field") != "comments":
                 continue
             value = change.get("value") or {}
@@ -3209,7 +4254,7 @@ async def payment_webhook(request: Request, background: BackgroundTasks) -> Resp
             log.info("Credit pack applied: igsid=%s balance=%s", igsid, balance)
             background.add_task(
                 _run_safely, bot.notify_payment, igsid,
-                MSG_PAYMENT_CREDITS.format(n=bot.s.credits_per_pack, balance=balance),
+                MSG_PAYMENT_CREDITS, {"n": bot.s.credits_per_pack, "balance": balance},
             )
             return JSONResponse({"status": "ok", "credits": balance})
 
@@ -3222,7 +4267,7 @@ async def payment_webhook(request: Request, background: BackgroundTasks) -> Resp
             log.info("Subscription extended: igsid=%s until=%s", igsid, until.isoformat())
             if _s(attrs.get("billing_reason")) in ("initial", ""):
                 background.add_task(
-                    _run_safely, bot.notify_payment, igsid, MSG_PAYMENT_SUB.format(date=f"{until:%b %d, %Y}")
+                    _run_safely, bot.notify_payment, igsid, MSG_PAYMENT_SUB, {"date": f"{until:%b %d, %Y}"}
                 )
             return JSONResponse({"status": "ok", "sub_until": until.isoformat()})
 
